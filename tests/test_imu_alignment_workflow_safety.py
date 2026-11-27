@@ -178,8 +178,12 @@ def test_missing_frame_time_imu_orientation_is_rejected(tmp_path):
         roll=0.0,
     )
 
+    metadata = SimpleNamespace(
+        timestamp_quality="callback", clock_sync_verified=True,
+        timing_uncertainty_s=None,
+    )
     with pytest.raises(ValueError, match="orientation"):
-        workflow.capture_camera_pair(pointing, 123.0, 1)
+        workflow.capture_camera_pair(pointing, 123.0, 1, metadata)
 
 
 def test_camera_fit_rejects_repeated_identical_attitudes(tmp_path):
@@ -199,9 +203,13 @@ def test_camera_fit_rejects_repeated_identical_attitudes(tmp_path):
             frame_id * 1_000_000,
             identity_quaternion,
         )
-        workflow.capture_camera_pair(pointing, timestamp, frame_id)
+        metadata = SimpleNamespace(
+            timestamp_quality="callback", clock_sync_verified=True,
+            timing_uncertainty_s=None,
+        )
+        workflow.capture_camera_pair(pointing, timestamp, frame_id, metadata)
 
-    with pytest.raises(ValueError, match="coverage|attitude"):
+    with pytest.raises(ValueError, match="distinct|coverage|attitude"):
         workflow.fit_camera_alignment()
 
 
@@ -226,6 +234,11 @@ def test_finalization_rejects_incomplete_or_unverified_calibration(tmp_path):
         "sensor_to_telescope": np.eye(3).tolist(),
         "camera_from_telescope": np.eye(3).tolist(),
         "calibration_method": "synthetic_test_only",
+        "camera_timing_evidence": {
+            "timestamp_source": "directshow_sample_callback_qpc",
+            "clock_sync_verified": True,
+            "exposure_midpoint_verified": False,
+        },
     }
     engine._imu_alignment_workflow = SimpleNamespace(
         measured_result=lambda: valid_measured
@@ -253,6 +266,11 @@ def test_finalization_persists_and_reload_validates_transforms(tmp_path):
         "sensor_to_telescope": np.eye(3).tolist(),
         "camera_from_telescope": np.eye(3).tolist(),
         "calibration_method": "synthetic_test_only",
+        "camera_timing_evidence": {
+            "timestamp_source": "directshow_sample_callback_qpc",
+            "clock_sync_verified": True,
+            "exposure_midpoint_verified": False,
+        },
     }
     engine._imu_alignment_workflow = SimpleNamespace(
         measured_result=lambda: measured

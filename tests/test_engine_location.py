@@ -1,3 +1,4 @@
+﻿import numpy as np
 def _telescope_to_sky(ra, dec, roll=0.0):
     """Synthetic telescope-body (+X boresight) to celestial transform."""
     import numpy as np
@@ -129,21 +130,36 @@ def _anchor_test_pointing(valid=True):
 
 def _anchor_test_service(orientation=(123456, (1.0, 0.0, 0.0, 0.0))):
     service = MagicMock()
+    service.sensor_mapping_verified = True
+    service.latest_snapshot = SimpleNamespace(continuity_id=0)
     service.orientation_at_host_time.return_value = orientation
     return service
+
+
+def _prepare_anchor_test_engine(eng):
+    eng._imu_camera_from_telescope = np.eye(3)
+
+
+def _anchor_test_frame_metadata():
+    return SimpleNamespace(
+        timestamp_quality="callback",
+        clock_sync_verified=True,
+    )
 
 
 def test_plate_solve_anchor_uses_orientation_at_frame_timestamp(tmp_path):
     eng = _make_engine(tmp_path)
     service = _anchor_test_service()
     eng._imu_service = service
+    _prepare_anchor_test_engine(eng)
 
     # Simulate a solver callback arriving well after the camera frame.
     frame_timestamp = time.monotonic() - 2.0
     frame_id = 42
 
     eng._capture_plate_solve_anchor(
-        _anchor_test_pointing(), frame_timestamp, frame_id
+        _anchor_test_pointing(), frame_timestamp, frame_id,
+        _anchor_test_frame_metadata(),
     )
 
     service.orientation_at_host_time.assert_called_once_with(frame_timestamp)
@@ -162,7 +178,11 @@ def test_plate_solve_anchor_uses_orientation_at_frame_timestamp(tmp_path):
 def test_plate_solve_anchor_clears_when_imu_service_missing(tmp_path):
     eng = _make_engine(tmp_path)
     eng._imu_service = _anchor_test_service()
-    eng._capture_plate_solve_anchor(_anchor_test_pointing(), 100.0, 1)
+    _prepare_anchor_test_engine(eng)
+    eng._capture_plate_solve_anchor(
+        _anchor_test_pointing(), 100.0, 1,
+        _anchor_test_frame_metadata(),
+    )
     assert eng.plate_solve_anchor is not None
 
     eng._imu_service = None
@@ -175,8 +195,12 @@ def test_plate_solve_anchor_clears_when_frame_orientation_unavailable(tmp_path):
     eng = _make_engine(tmp_path)
     service = _anchor_test_service(orientation=None)
     eng._imu_service = service
+    _prepare_anchor_test_engine(eng)
 
-    eng._capture_plate_solve_anchor(_anchor_test_pointing(), 100.0, 1)
+    eng._capture_plate_solve_anchor(
+        _anchor_test_pointing(), 100.0, 1,
+        _anchor_test_frame_metadata(),
+    )
 
     service.orientation_at_host_time.assert_called_once_with(100.0)
     assert eng.plate_solve_anchor is None
@@ -516,6 +540,7 @@ def test_synthetic_anchor_uses_exact_frame_timestamp(tmp_path):
         1_000_000,
         [1.0, 0.0, 0.0, 0.0],
     )
+    imu.latest_snapshot = SimpleNamespace(continuity_id=0)
     eng._imu_service = imu
     eng._imu_camera_from_telescope = np.eye(3)
 
@@ -525,6 +550,7 @@ def test_synthetic_anchor_uses_exact_frame_timestamp(tmp_path):
         pointing,
         frame_timestamp=frame_timestamp,
         frame_id=frame_id,
+        frame_metadata=_anchor_test_frame_metadata(),
     )
 
     imu.orientation_at_host_time.assert_called_once_with(frame_timestamp)
@@ -700,3 +726,4 @@ def test_synthetic_worker_roll_motion_preserves_pointing_coordinates(tmp_path):
     after = eng.pointing_state.read()
     assert after.ra_j2000 == pytest.approx(before.ra_j2000, abs=1e-7)
     assert after.dec_j2000 == pytest.approx(before.dec_j2000, abs=1e-7)
+

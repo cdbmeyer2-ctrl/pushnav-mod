@@ -189,6 +189,11 @@ def test_full_synthetic_alignment_workflow_minimum_evidence(
             pointing,
             frame_timestamp,
             frame_id,
+            SimpleNamespace(
+                timestamp_quality="callback",
+                clock_sync_verified=True,
+                timing_uncertainty_s=0.001,
+            ),
         )
 
     assert workflow.status()["camera_pair_count"] == 4
@@ -216,5 +221,5 @@ def test_full_synthetic_alignment_workflow_minimum_evidence(
         atol=1e-5,
     )
     assert measured["calibration_method"] == (
-        "physical_sweeps_and_paired_plate_solves_v1"
+        "physical_sweeps_and_paired_plate_solves_v2"
     )

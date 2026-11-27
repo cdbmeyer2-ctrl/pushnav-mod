@@ -37,6 +37,8 @@ from evf.camera.protocol import (
     encode_message,
     read_message,
     type_name,
+    encode_frame_metadata,
+    decode_frame_payload,
 )
 from evf.camera.client import CameraClient, ProtocolError
 from evf.engine.frame_buffer import LatestFrame
@@ -79,6 +81,33 @@ class TestProtocolCodec:
         assert "UNKNOWN" in type_name(0xFF)
 
 
+class TestFrameMetadata:
+    def test_v2_metadata_round_trip(self):
+        payload = encode_frame_metadata(
+            frame_id=12, qpc_ticks=10_000_000, qpc_frequency=10_000_000,
+            sample_time_100ns=123456, flags=1,
+        ) + b"\\xff\\xd8jpeg"
+        jpeg, metadata = decode_frame_payload(payload)
+        assert jpeg == b"\\xff\\xd8jpeg"
+        assert metadata["frame_id"] == 12
+        assert metadata["timestamp"] == 1.0
+        assert metadata["timestamp_quality"] == "callback"
+        assert metadata["sample_time_valid"] is True
+
+    def test_legacy_frame_is_explicitly_untrusted(self):
+        jpeg, metadata = decode_frame_payload(b"\\xff\\xd8legacy")
+        assert jpeg == b"\\xff\\xd8legacy"
+        assert metadata["timestamp_quality"] == "untrusted"
+        assert metadata["frame_id"] is None
+
+    def test_invalid_qpc_metadata_is_rejected(self):
+        import struct
+        from evf.camera.protocol import FRAME_META_FMT, FRAME_META_MAGIC
+        bad = struct.pack(FRAME_META_FMT, FRAME_META_MAGIC, 0, 1, 1, 0, 0) + b"jpeg"
+        with pytest.raises(ValueError, match="invalid frame"):
+            decode_frame_payload(bad)
+
+
 # ---------------------------------------------------------------------------
 # CameraClient + MockCameraServer integration
 # ---------------------------------------------------------------------------
@@ -106,6 +135,28 @@ class TestCameraClientIntegration:
             assert "exposure" in ids
             assert "gain" in ids
 
+            client.stop()
+        finally:
+            server.stop()
+
+    def test_v2_qpc_handshake_and_timestamped_frames(self):
+        server = self._start_server(hello={
+            "protocol_version": 2,
+            "timestamp_clock": "windows_qpc",
+        })
+        try:
+            buf = LatestFrame()
+            client = CameraClient(buf, port=server.port)
+            client.connect(timeout=5.0)
+            assert client._clock_sync["verified_same_host_clock"] is True
+            client.start_receiving()
+            time.sleep(0.25)
+            jpeg, timestamp, frame_id, metadata = buf.get_with_metadata()
+            assert jpeg is not None
+            assert timestamp > 0
+            assert frame_id > 0
+            assert metadata.timestamp_quality == "callback"
+            assert metadata.clock_sync_verified is True
             client.stop()
         finally:
             server.stop()
