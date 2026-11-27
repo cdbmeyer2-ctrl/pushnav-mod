@@ -53,7 +53,7 @@ class SolverThread:
         state_machine: StateMachine,
         config: ConfigManager,
         audio: AudioAlert | None = None,
-        on_plate_solve: Callable[[PointingSnapshot, float, int], None] | None = None,
+        on_plate_solve: Callable[..., None] | None = None,
     ) -> None:
         self._solver = solver
         self._frame_buffer = frame_buffer
@@ -209,7 +209,13 @@ class SolverThread:
                 )
                 return
 
-            jpeg_bytes, _timestamp, frame_id = self._frame_buffer.get()
+            if hasattr(self._frame_buffer, "get_with_metadata"):
+                jpeg_bytes, _timestamp, frame_id, frame_metadata = (
+                    self._frame_buffer.get_with_metadata()
+                )
+            else:
+                jpeg_bytes, _timestamp, frame_id = self._frame_buffer.get()
+                frame_metadata = None
             if jpeg_bytes is None or frame_id == last_frame_id:
                 time.sleep(0.01)
                 continue
@@ -263,6 +269,11 @@ class SolverThread:
                 )
                 if self._on_plate_solve is not None:
                     try:
+                        self._on_plate_solve(
+                            self._pointing.read(), _timestamp, frame_id, frame_metadata
+                        )
+                    except TypeError:
+                        # Preserve older three-argument callback integrations.
                         self._on_plate_solve(self._pointing.read(), _timestamp, frame_id)
                     except Exception:
                         logger.exception("Plate-solve callback failed")

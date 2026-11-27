@@ -1,16 +1,13 @@
 # SPEC_PROTOCOL_CAMERA.md — PushNav
 
 Document version: 2.1
-Protocol version (wire): **1** — must match `data/VERSION.json.protocol_version`
-and `PROTOCOL_VERSION` in `python/evf/camera/client.py`, `camera/mac/Sources/.../main.swift`, and the Linux/Windows camera servers.
+Protocol version (wire): **2** for the updated Windows DirectShow backend; Python remains backward-compatible with v1 servers. macOS/Linux backends may continue using v1 until independently upgraded.
 Status: Reflects Current Implementation
 Date: 2026-04-20
 Transport: TCP on localhost
 Applies to: macOS (Swift), Linux (C/V4L2), Windows (C/DirectShow)
 
-The document-revision number above (2.1) is editorial — it tracks updates to
-this spec file, not the wire protocol. The wire protocol is unchanged since
-v1 of the project.
+The document-revision number above (2.1) is editorial. Wire v2 adds a Windows-only native frame metadata envelope and QPC clock handshake; JPEG-only v1 frames remain supported for non-calibration display/solving.
 
 ---
 
@@ -184,6 +181,42 @@ Rules:
 
 ---
 
+### 5.1.1 Version 2 DirectShow frame metadata (Windows)
+
+Windows v2 sends FRAME payloads as a 40-byte little-endian metadata header
+followed by the JPEG bytes:
+
+| Offset | Type | Meaning |
+|---:|---|---|
+| 0 | 4 bytes | ASCII magic `PNF2` |
+| 4 | u64 | Monotonic native frame sequence |
+| 12 | u64 | QueryPerformanceCounter ticks sampled in SampleCB |
+| 20 | u64 | QueryPerformanceFrequency |
+| 28 | i64/u64 bits | DirectShow sample start time in 100 ns units; zero if unavailable |
+| 36 | u32 | bit 0 indicates DirectShow sample time is available |
+| 40 | bytes | JPEG payload |
+
+The QPC timestamp is taken in the DirectShow Sample Grabber callback. It
+provides a timestamp in the Windows host QPC clock domain, not a guaranteed
+sensor exposure-midpoint timestamp. The DirectShow sample time is retained
+as evidence but is not assumed to share the QPC epoch.
+
+After CONTROL_INFO, v2 client sends CLOCK_SYNC_REQUEST (0x13). The server
+responds with CLOCK_SYNC (0x04), a JSON object containing `qpc_ticks` and
+`qpc_frequency`. Python validates that this QPC value agrees with its
+`time.monotonic()` clock on the same host. The client then accepts PNF2
+frames and maps QPC ticks to seconds. Frame sequence and timestamps must be
+strictly increasing.
+
+V1 JPEG-only frames are still accepted for ordinary camera use, but their
+TCP receipt timestamps are explicitly untrusted and MUST NOT be used for
+camera/IMU alignment or celestial propagation.
+
+Physical camera alignment must be captured while the telescope is stationary
+at each solved pointing. This reduces sensitivity to callback-vs-exposure
+latency. Do not interpret QPC clock-domain verification as verification of
+the sensor exposure midpoint.
+
 ### 5.2 App → Camera
 
 #### 0x11 SET_CONTROL
@@ -265,7 +298,7 @@ This enables backend development independent of the full UI.
 ## 9. Reserved Extensions (Do not use in v1)
 
 Reserved message types:
-- 0x13 START_STREAM
+- 0x14 START_STREAM
 - 0x14 STOP_STREAM
 - 0x15 SET_STREAM_CONFIG
 - 0x16 GET_LATEST_FRAME

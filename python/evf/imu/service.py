@@ -30,6 +30,7 @@ class ImuSnapshot:
     device_time_us: int
     received_at_monotonic: float
     raw_sample: RawSample
+    continuity_id: int = 0
 
 
 class ImuService:
@@ -52,6 +53,8 @@ class ImuService:
         self._latest_attitude: Attitude | None = None
         self._latest_snapshot: ImuSnapshot | None = None
         self._orientation_history: deque[ImuSnapshot] = deque(maxlen=2000)
+        self._continuity_id = 0
+        self._max_contiguous_gap_us = 250_000
 
     @property
     def latest_attitude(self) -> Attitude | None:
@@ -149,6 +152,7 @@ class ImuService:
                 raise RuntimeError("IMU estimator is not initialized")
             self.estimator.set_sensor_to_telescope(matrix)
             self.sensor_mapping_verified = True
+            self._continuity_id += 1
             with self._attitude_lock:
                 self._latest_attitude = None
                 self._latest_snapshot = None
@@ -253,7 +257,10 @@ class ImuService:
             self.stream.start()
 
             self._worker_stop_event.clear()
+            self._continuity_id += 1
             with self._attitude_lock:
+                self._latest_attitude = None
+                self._latest_snapshot = None
                 self._orientation_history.clear()
             self._worker_thread = threading.Thread(
                 target=self._run_estimator,
@@ -355,57 +362,58 @@ class ImuService:
         return calibration
 
     def _run_estimator(self) -> None:
-        """Process each new serial record once, in device timestamp order."""
+        """Process records once; a >250 ms gap starts a new attitude epoch."""
         last_device_time_us: int | None = None
-
         try:
             while not self._worker_stop_event.is_set():
                 if self.stream is None or self.estimator is None:
                     break
-
                 records = self.stream.history.snapshot()
-
                 for record in records:
                     if self._worker_stop_event.is_set():
                         break
-
-                    if (
-                        last_device_time_us is not None
-                        and record.device_time_us <= last_device_time_us
-                    ):
-                        continue
-
+                    if last_device_time_us is not None:
+                        if record.device_time_us <= last_device_time_us:
+                            continue
+                        gap_us = record.device_time_us - last_device_time_us
+                        if gap_us > self._max_contiguous_gap_us:
+                            with self._estimator_lock:
+                                self.estimator.reset_reference()
+                            self._continuity_id += 1
+                            with self._attitude_lock:
+                                self._latest_attitude = None
+                                self._latest_snapshot = None
+                                self._orientation_history.clear()
+                            logger.warning(
+                                "IMU continuity lost (%.3fs gap); requiring a new "
+                                "gravity reference and plate-solve anchor",
+                                gap_us / 1_000_000.0,
+                            )
                     with self._estimator_lock:
                         attitude = self.estimator.update(
-                            record.sample,
-                            device_time_us=record.device_time_us,
+                            record.sample, device_time_us=record.device_time_us
                         )
                         quaternion = tuple(self.estimator.q)
                     last_device_time_us = record.device_time_us
-
                     published = replace(
                         attitude,
                         sample_age_s=max(
-                            0.0,
-                            time.monotonic() - record.received_at_monotonic,
+                            0.0, time.monotonic() - record.received_at_monotonic
                         ),
                     )
-
                     snapshot = ImuSnapshot(
                         attitude=published,
                         quaternion=quaternion,
                         device_time_us=record.device_time_us,
                         received_at_monotonic=record.received_at_monotonic,
                         raw_sample=record.sample,
+                        continuity_id=self._continuity_id,
                     )
-
                     with self._attitude_lock:
                         self._latest_attitude = published
                         self._latest_snapshot = snapshot
                         self._orientation_history.append(snapshot)
-
                 time.sleep(0.005)
-
         except Exception:
             logger.exception("IMU estimator worker failed.")
 

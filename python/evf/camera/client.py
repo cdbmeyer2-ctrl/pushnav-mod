@@ -23,10 +23,14 @@ Per SPEC_PROTOCOL_CAMERA.md §4–5 and SPEC_ARCHITECTURE.md §4.1/§7.
 import json
 import logging
 import socket
+import struct
 import threading
 import time
 
 from evf.camera.protocol import (
+    MSG_CLOCK_SYNC,
+    MSG_CLOCK_SYNC_REQUEST,
+    decode_frame_payload,
     MSG_CONTROL_INFO,
     MSG_ERROR,
     MSG_FRAME,
@@ -39,11 +43,11 @@ from evf.camera.protocol import (
     read_message,
     type_name,
 )
-from evf.engine.frame_buffer import LatestFrame
+from evf.engine.frame_buffer import LatestFrame, FrameMetadata
 
 logger = logging.getLogger(__name__)
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8764
 
@@ -72,6 +76,8 @@ class CameraClient:
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._frame_id = 0
+        self._last_qpc_timestamp = 0.0
+        self._clock_sync: dict = {}
         self._controls: list[dict] = []
         self._controls_lock = threading.Lock()
         self._hello_info: dict = {}
@@ -104,21 +110,44 @@ class CameraClient:
 
         # Validate protocol version
         cam_version = self._hello_info.get("protocol_version")
-        if cam_version != PROTOCOL_VERSION:
-            raise ProtocolError(
-                f"Protocol version mismatch: camera={cam_version}, expected={PROTOCOL_VERSION}"
-            )
+        if cam_version not in (1, 2):
+            raise ProtocolError(f"Unsupported camera protocol version: {cam_version}")
 
-        # Send our HELLO response
-        our_hello = {"protocol_version": PROTOCOL_VERSION, "app": "evf", "app_version": "0.2.1"}
+        our_hello = {"protocol_version": cam_version, "app": "evf", "app_version": "0.3.0"}
         self._sock.sendall(encode_json_message(MSG_HELLO, our_hello))
-        logger.debug("Sent HELLO response")
 
-        # Receive CONTROL_INFO
         msg_type, payload = read_message(self._sock)
         if msg_type != MSG_CONTROL_INFO:
             raise ProtocolError(f"Expected CONTROL_INFO, got {type_name(msg_type)}")
         self._update_controls(payload)
+
+        if cam_version == 2:
+            if self._hello_info.get("timestamp_clock") != "windows_qpc":
+                raise ProtocolError("Protocol v2 requires windows_qpc timestamp clock")
+            t0 = time.monotonic()
+            self._sock.sendall(encode_message(MSG_CLOCK_SYNC_REQUEST))
+            msg_type, payload = read_message(self._sock)
+            t1 = time.monotonic()
+            if msg_type != MSG_CLOCK_SYNC:
+                raise ProtocolError(f"Expected CLOCK_SYNC, got {type_name(msg_type)}")
+            try:
+                sync = json.loads(payload.decode("utf-8"))
+                qpc = int(sync["qpc_ticks"])
+                frequency = int(sync["qpc_frequency"])
+                if qpc <= 0 or frequency <= 0:
+                    raise ValueError("non-positive QPC values")
+                qpc_seconds = qpc / frequency
+                if not (t0 - 5.0 <= qpc_seconds <= t1 + 5.0):
+                    raise ValueError("QPC clock does not match host monotonic clock")
+                self._clock_sync = {
+                    "clock": "windows_qpc",
+                    "frequency": frequency,
+                    "round_trip_s": max(0.0, t1 - t0),
+                    "verified_same_host_clock": True,
+                }
+            except (KeyError, TypeError, ValueError, UnicodeDecodeError,
+                    json.JSONDecodeError) as exc:
+                raise ProtocolError(f"Invalid camera clock sync: {exc}") from exc
 
         self._connected = True
         return self._hello_info
@@ -215,9 +244,43 @@ class CameraClient:
 
     def _handle_message(self, msg_type: int, payload: bytes) -> None:
         if msg_type == MSG_FRAME:
-            self._frame_id += 1
-            self._last_frame_time = time.monotonic()
-            self._frame_buffer.set(payload, self._last_frame_time, self._frame_id)
+            receipt_time = time.monotonic()
+            try:
+                jpeg, metadata = decode_frame_payload(payload)
+            except (ValueError, struct.error) as exc:
+                logger.warning("Rejected malformed camera frame: %s", exc)
+                return
+            if not jpeg:
+                logger.warning("Rejected empty camera frame")
+                return
+            frame_id = metadata["frame_id"]
+            if frame_id is None:
+                self._frame_id += 1
+                frame_id = self._frame_id
+                timestamp = receipt_time
+            else:
+                if frame_id <= self._frame_id:
+                    logger.debug("Rejected duplicate/out-of-order frame %d", frame_id)
+                    return
+                timestamp = metadata["timestamp"]
+                if timestamp <= self._last_qpc_timestamp:
+                    logger.warning("Rejected non-monotonic QPC frame timestamp")
+                    return
+                if abs(timestamp - receipt_time) > 10.0:
+                    logger.warning("Rejected QPC timestamp outside host clock domain")
+                    return
+                self._last_qpc_timestamp = timestamp
+            self._frame_id = frame_id
+            self._last_frame_time = receipt_time
+            frame_meta = FrameMetadata(
+                timestamp_source=metadata["timestamp_source"],
+                timestamp_quality=metadata["timestamp_quality"],
+                sample_time_100ns=metadata["sample_time_100ns"],
+                sample_time_valid=metadata["sample_time_valid"],
+                timing_uncertainty_s=metadata["timing_uncertainty_s"],
+                clock_sync_verified=bool(self._clock_sync.get("verified_same_host_clock")),
+            )
+            self._frame_buffer.set(jpeg, timestamp, frame_id, frame_meta)
         elif msg_type == MSG_CONTROL_INFO:
             self._update_controls(payload)
         elif msg_type == MSG_ERROR:

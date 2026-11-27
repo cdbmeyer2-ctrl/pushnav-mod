@@ -32,6 +32,9 @@ from pathlib import Path
 from evf.camera.protocol import (
     MSG_CONTROL_INFO,
     MSG_FRAME,
+    MSG_CLOCK_SYNC,
+    MSG_CLOCK_SYNC_REQUEST,
+    encode_frame_metadata,
     MSG_GET_CONTROLS,
     MSG_HELLO,
     MSG_SET_CONTROL,
@@ -191,6 +194,15 @@ class MockCameraServer:
             # Send CONTROL_INFO
             client.sendall(encode_json_message(MSG_CONTROL_INFO, self._controls))
 
+            if self._hello.get("protocol_version") == 2:
+                msg_type, _ = read_message(client)
+                if msg_type != MSG_CLOCK_SYNC_REQUEST:
+                    raise DisconnectError("Expected CLOCK_SYNC_REQUEST")
+                client.sendall(encode_json_message(MSG_CLOCK_SYNC, {
+                    "qpc_ticks": time.monotonic_ns(),
+                    "qpc_frequency": 1_000_000_000,
+                }))
+
             # Start streaming + handle incoming commands
             self._stream_loop(client)
         except (DisconnectError, ConnectionResetError, BrokenPipeError, OSError) as exc:
@@ -209,7 +221,14 @@ class MockCameraServer:
             # Send a frame
             frame_data = self._frames[frame_idx % len(self._frames)]
             try:
-                client.sendall(encode_message(MSG_FRAME, frame_data))
+                if self._hello.get("protocol_version") == 2:
+                    ticks = time.monotonic_ns()
+                    metadata = encode_frame_metadata(
+                        frame_idx + 1, ticks, 1_000_000_000
+                    )
+                    client.sendall(encode_message(MSG_FRAME, metadata + frame_data))
+                else:
+                    client.sendall(encode_message(MSG_FRAME, frame_data))
             except (BrokenPipeError, ConnectionResetError, OSError):
                 raise DisconnectError("Send failed")
             frame_idx += 1
