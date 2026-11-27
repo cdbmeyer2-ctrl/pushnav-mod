@@ -1,0 +1,3782 @@
+PUSHNAV CONSOLIDATED IMPLEMENTATION INSPECTION
+Repository: C:\Users\18123\Downloads\pushnav-4f563af0\pushnav-4f563af0eccf452fbdb629eef4442edcba1440c1
+Selected source files: 6
+
+
+====================================================================================================
+FILE: python\evf\engine\engine.py  [keyword score=7]
+====================================================================================================
+# Copyright (C) 2026 Arun Venkataswamy
+#
+# This file is part of PushNav.
+#
+# PushNav is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# PushNav is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with PushNav. If not, see <https://www.gnu.org/licenses/>.
+
+"""Engine coordinator ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â wires all components together.
+
+Per SPEC_ARCHITECTURE.md and impl0.md Ãƒâ€šÃ‚Â§Phase 8.
+Central coordinator that owns the lifecycle of every subsystem.
+"""
+
+import io
+import json
+import logging
+import os
+import re
+import threading
+import tempfile
+from dataclasses import dataclass
+import time
+from pathlib import Path
+
+from evf.camera.subprocess_mgr import SubprocessManager
+from evf.config.logging_setup import setup_logging
+from evf.config.manager import ConfigManager
+from evf.engine.audio import AudioAlert
+from evf.engine.frame_buffer import LatestFrame
+from evf.engine.goto_target import GotoTarget
+from evf.engine.pointing import PointingSnapshot, PointingState
+from evf.engine.sample_injector import SampleInjector
+from evf.engine.state import EngineState, StateMachine
+from evf.engine.status_led import StatusLedController, find_leds
+from evf.solver.solver import PlateSolver
+import numpy as np
+
+from evf.solver.sync import (
+    SyncCandidate,
+    auto_select,
+    build_sync_candidates,
+    compute_body_frame_sync,
+    orientation_from_radec_roll,
+)
+from evf.network import local_ip
+from evf.paths import version_json
+from evf.solver.thread import SolverThread
+from evf.lx200.server import Lx200Server
+from evf.stellarium.server import StellariumServer
+from evf.webserver.server import WebServer
+from evf.imu.service import ImuService
+from evf.imu.alignment_workflow import ImuAlignmentWorkflow
+
+logger = logging.getLogger(__name__)
+
+_VERSION_PATH = version_json()
+
+
+def _read_app_version() -> str:
+    """Read app_version string from VERSION.json at engine init.
+
+    Falls back to '0.0.0' if the file is missing or malformed so that the
+    LX200 :GVN# reply always returns a well-formed 'PushNav <version>#'.
+    """
+    try:
+        with open(_VERSION_PATH) as f:
+            data = json.load(f)
+        return str(data.get("app_version", "0.0.0"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return "0.0.0"
+
+
+_V4L2_SYSFS = Path("/sys/class/video4linux")
+# A USB camera's sysfs device path runs through a root hub (".../usb3/3-2/...");
+# SoC video blocks (Pi ISP, HEVC decoder) sit under /platform/ with no /usbN/.
+_USB_DEVICE_PATH = re.compile(r"/usb\d+/")
+
+
+def _usb_video_device_present() -> bool:
+    """True if any USB video device is attached (Linux sysfs).
+
+    Lets the headless camera watchdog skip spawning camera_server ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â and
+    logging its failure ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â every few seconds while nothing is plugged in.
+    Returns True when sysfs is unavailable, so the caller just tries.
+    """
+    if not _V4L2_SYSFS.is_dir():
+        return True
+    for node in _V4L2_SYSFS.iterdir():
+        try:
+            if _USB_DEVICE_PATH.search(str((node / "device").resolve())):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+@dataclass(frozen=True)
+class PlateSolveAnchor:
+    """A successful celestial solution paired with one IMU orientation."""
+    ra_j2000: float
+    dec_j2000: float
+    roll: float
+    pointing_timestamp: float
+    frame_timestamp: float
+    frame_id: int
+    quaternion: tuple[float, float, float, float]
+    imu_device_time_us: int
+    telescope_to_sky: tuple[tuple[float, float, float], ...]
+    continuity_id: int = 0
+
+
+class Engine:
+    """Central coordinator that owns all components and manages their lifecycle.
+
+    Startup creates shared data structures (LatestFrame, PointingState,
+    StateMachine, ConfigManager) and launches subsystems (camera subprocess,
+    Stellarium server, solver).  The UI reads from these structures and
+    calls back into the engine for tracking toggle and camera control changes.
+    """
+
+    def __init__(
+        self,
+        *,
+        dev_mode: bool = False,
+        config: ConfigManager | None = None,
+    ) -> None:
+        # Shared data structures
+        self._frame_buffer = LatestFrame()
+        self._pointing_state = PointingState()
+        self._state_machine = StateMachine()
+        self._config = config if config is not None else ConfigManager()
+        self._goto_target = GotoTarget()
+        self._app_version = _read_app_version()
+        self._dev_mode = dev_mode
+
+        # Sample injector (continuous JPEG injection for dev/debug)
+        self._sample_injector = SampleInjector(self._frame_buffer)
+
+        # Components (created during startup)
+        self._solver: PlateSolver | None = None
+        self._solver_thread: SolverThread | None = None
+        self._audio: AudioAlert | None = None
+        self._subprocess_mgr: SubprocessManager | None = None
+        # Serializes camera (re)starts: the UI "Retry camera" button, the
+        # headless watchdog and shutdown must never race each other.
+        self._camera_lock = threading.Lock()
+        self._camera_watchdog: threading.Thread | None = None
+        self._status_led: StatusLedController | None = None
+        # Set once shutdown() begins; stops the watchdog and refuses retries.
+        self._shutting_down = threading.Event()
+        # "Waiting for camera" is logged once per absence, not every attempt.
+        self._camera_wait_logged = False
+        self._stellarium: StellariumServer | None = None
+        self._lx200: Lx200Server | None = None
+        self._webserver: WebServer | None = None
+        self._imu_service: ImuService | None = None
+        self._imu_alignment_workflow: ImuAlignmentWorkflow | None = None
+        self._imu_camera_capture_active = False
+        self._imu_camera_from_telescope: np.ndarray | None = None
+        self._plate_solve_anchor_lock = threading.Lock()
+        self._plate_solve_anchor: PlateSolveAnchor | None = None
+        self._imu_tracking_stop = threading.Event()
+        self._imu_tracking_thread: threading.Thread | None = None
+
+        # Sync state (two-phase calibration)
+        self._sync_lock = threading.Lock()
+        self._sync_error: str | None = None
+        self._sync_candidates: list[SyncCandidate] | None = None
+        self._sync_selected_idx: int | None = None
+        self._sync_camera_ra: float = 0.0
+        self._sync_camera_dec: float = 0.0
+        self._sync_camera_roll: float = 0.0
+
+    # -- properties -----------------------------------------------------------
+
+    @property
+    def frame_buffer(self) -> LatestFrame:
+        return self._frame_buffer
+
+    @property
+    def pointing_state(self) -> PointingState:
+        return self._pointing_state
+
+    @property
+    def state_machine(self) -> StateMachine:
+        return self._state_machine
+
+    @property
+    def config(self) -> ConfigManager:
+        return self._config
+
+    @property
+    def app_version(self) -> str:
+        return self._app_version
+
+    @property
+    def dev_mode(self) -> bool:
+        return self._dev_mode
+
+    @property
+    def sample_injector(self) -> SampleInjector:
+        return self._sample_injector
+
+    @property
+    def imu_attitude(self):
+        """Latest read-only relative IMU attitude, if available."""
+        if self._imu_service is None:
+            return None
+        return self._imu_service.latest_attitude
+
+    @property
+    def imu_snapshot(self):
+        """Latest synchronized IMU snapshot, if available."""
+        if self._imu_service is None:
+            return None
+        return self._imu_service.latest_snapshot
+
+    @property
+    def plate_solve_anchor(self) -> PlateSolveAnchor | None:
+        """Latest valid plate-solve/IMU anchor, if one was captured."""
+        with self._plate_solve_anchor_lock:
+            return self._plate_solve_anchor
+
+    @property
+    def camera_connected(self) -> bool:
+        """True if the camera subprocess is running and connected."""
+        return self._subprocess_mgr is not None and self._subprocess_mgr.running
+
+    @property
+    def camera_controls(self) -> list[dict] | None:
+        """Return the current camera controls, or None if not connected."""
+        if self._subprocess_mgr and self._subprocess_mgr.client:
+            return self._subprocess_mgr.client.controls
+        return None
+
+    @property
+    def consecutive_failures(self) -> int:
+        if self._solver_thread:
+            return self._solver_thread.consecutive_failures
+        return 0
+
+    @property
+    def audio_enabled(self) -> bool:
+        return self._config.audio_enabled
+
+    @audio_enabled.setter
+    def audio_enabled(self, value: bool) -> None:
+        self._config.audio_enabled = value
+        if self._audio:
+            self._audio.enabled = value
+
+    @property
+    def goto_target(self) -> GotoTarget:
+        return self._goto_target
+
+    def clear_goto_target(self) -> None:
+        self._goto_target.clear()
+
+    def set_goto_target(self, ra_deg: float, dec_deg: float) -> None:
+        """Set the GOTO target. Used by the catalog 'Set as target' flow."""
+        self._goto_target.set(float(ra_deg), float(dec_deg))
+
+    def set_audio_enabled(self, enabled: bool) -> None:
+        self.audio_enabled = enabled
+
+    def set_lx200_epoch(self, epoch: str) -> None:
+        """Set the LX200 reported coordinate epoch ('jnow' or 'j2000').
+
+        'jnow' is the LX200 standard (SkySafari / INDI / ASCOM / real Meade);
+        'j2000' is for Stellarium Mobile PLUS, which reads LX200 coords as J2000.
+        Persists to config and applies to the running server immediately.
+        """
+        epoch = epoch.lower()
+        if epoch not in ("jnow", "j2000"):
+            raise ValueError(f"lx200_epoch must be 'jnow' or 'j2000', got {epoch!r}")
+        self._config.lx200_epoch = epoch
+        if self._lx200 is not None:
+            self._lx200.set_report_j2000(epoch == "j2000")
+
+    @property
+    def location(self) -> dict:
+        """Resolve the active observer location.
+
+        Priority:
+          1. Stellarium status 'location' field, when a Stellarium client is
+             actively reporting one (source='stellarium').
+          2. ConfigManager.location, when manually set (source='manual').
+          3. None ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â neither available (source=None, lat/lon both None).
+        """
+        if self._stellarium is not None:
+            status = self._stellarium.stellarium_status
+            if status:
+                loc = status.get("location") if isinstance(status, dict) else None
+                if loc and loc.get("latitude") is not None and loc.get("longitude") is not None:
+                    return {
+                        "latitude": float(loc["latitude"]),
+                        "longitude": float(loc["longitude"]),
+                        "source": "stellarium",
+                    }
+        manual = self._config.location
+        if manual is not None:
+            return {
+                "latitude": manual[0],
+                "longitude": manual[1],
+                "source": "manual",
+            }
+        return {"latitude": None, "longitude": None, "source": None}
+
+    def set_location(self, latitude: float | None, longitude: float | None) -> None:
+        """Persist a manual location. Pass (None, None) to clear."""
+        if latitude is None or longitude is None:
+            self._config.location = None
+        else:
+            self._config.location = (float(latitude), float(longitude))
+
+    def inject_sample(self, name: str | None) -> None:
+        """Start/stop continuous injection of a sample image (dev only).
+
+        name: one of {"a","b","c","d","orion"} or None to stop.
+        """
+        from evf.paths import samples_dir
+        from evf.engine.sample_injector import load_sample_jpeg
+
+        if not self._dev_mode:
+            logger.warning("inject_sample called outside dev_mode ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â ignoring")
+            return
+        if name is None:
+            self._sample_injector.set_jpeg(None, None)
+            self._frame_buffer.clear()
+            logger.info("Sample injection stopped")
+            return
+        sd = samples_dir()
+        if sd is None:
+            logger.error("Samples directory not available in this build")
+            return
+        try:
+            jpeg = load_sample_jpeg(sd, name)
+            self._sample_injector.set_jpeg(jpeg, name)
+            logger.info("Sample injection started: %s.png", name)
+        except Exception as exc:
+            logger.error("Failed to load sample %s: %s", name, exc)
+
+    def inject_target(self, ra_deg: float, dec_deg: float) -> None:
+        """Set the GOTO target manually (dev only)."""
+        if not self._dev_mode:
+            logger.warning("inject_target called outside dev_mode ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â ignoring")
+            return
+        self._goto_target.set(ra_deg, dec_deg)
+        logger.info("Dev: injected GOTO target at RA %.4fÃƒâ€šÃ‚Â° Dec %.4fÃƒâ€šÃ‚Â°", ra_deg, dec_deg)
+
+    def capture_frame(self) -> Path | None:
+        """Save the latest frame to ~/Downloads as PNG. Returns the path or None."""
+        from datetime import datetime
+        from PIL import Image
+
+        jpeg, _ts, _fid = self._frame_buffer.get()
+        if jpeg is None:
+            return None
+        img = Image.open(io.BytesIO(jpeg)).convert("RGB")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest = Path.home() / "Downloads" / f"evf_capture_{timestamp}.png"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        img.save(dest)
+        logger.info("Frame captured: %s", dest)
+        return dest
+
+    def set_min_matches(self, value: int) -> None:
+        self._config.min_matches = int(value)
+
+    def set_max_prob(self, value: float) -> None:
+        self._config.max_prob = float(value)
+
+    @property
+    def stellarium_status(self) -> dict | None:
+        if self._stellarium:
+            return self._stellarium.stellarium_status
+        return None
+
+    @property
+    def stellarium_object(self) -> dict | None:
+        if self._stellarium:
+            return self._stellarium.stellarium_object
+        return None
+
+    @property
+    def stellarium_address(self) -> str | None:
+        """Address to paste into desktop Stellarium's Telescope Control plugin.
+
+        On a Raspberry Pi appliance the server binds 0.0.0.0, so advertise the
+        LAN IP for desktop Stellarium running on another machine. On Mac /
+        Windows / x86 Linux dev boxes the server binds 127.0.0.1 (same-machine
+        use), so advertise "localhost". Falls back to "localhost" if the
+        server is bound to 0.0.0.0 but no LAN IP is available.
+        """
+        if self._stellarium is None:
+            return None
+        port = self._stellarium.port
+        if self._stellarium.host == "0.0.0.0":
+            ip = local_ip()
+            if ip is not None:
+                return f"{ip}:{port}"
+        return f"localhost:{port}"
+
+    @property
+    def lx200_address(self) -> str | None:
+        """Address to paste into SkySafari / Stellarium Mobile / INDI / ASCOM.
+
+        LX200 server binds 0.0.0.0 so we advertise the LAN IP (same IP the
+        mobile web URL uses) so mobile apps on the same network can connect.
+
+        Returns None when the LX200 server isn't running OR no LAN is
+        available ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the UI distinguishes these via the lx200_running flag.
+        """
+        if self._lx200 is None:
+            return None
+        ip = local_ip()
+        if ip is None:
+            return None
+        return f"{ip}:{self._lx200.port}"
+
+    @property
+    def lx200_running(self) -> bool:
+        """True if the LX200 server bound its socket successfully."""
+        return self._lx200 is not None
+
+    @property
+    def stellarium_has_client(self) -> bool:
+        """True if the Stellarium server currently has any client connected.
+
+        Stellarium holds a persistent TCP connection, so this is a simple
+        boolean ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the UI lights the Stellarium activity indicator while it
+        is True.
+        """
+        return self._stellarium is not None and self._stellarium.client_count > 0
+
+    # LX200 clients (notably SkySafari in polling mode) open a fresh TCP
+    # connection per command, so "has client connected right now" is almost
+    # never True. Instead we expose the time since the last connect or
+    # received command and hold the indicator lit for _LX200_INDICATOR_HOLD
+    # seconds. The user asked for a minimum hold of 100 ms.
+    _LX200_INDICATOR_HOLD = 0.1  # seconds
+
+    @property
+    def lx200_active(self) -> bool:
+        """True if the LX200 server saw a connect or a command within the
+        last _LX200_INDICATOR_HOLD seconds."""
+        if self._lx200 is None:
+            return False
+        last = self._lx200.last_activity_monotonic
+        if last == 0.0:
+            return False
+        return (time.monotonic() - last) < self._LX200_INDICATOR_HOLD
+
+    # -- startup (Ãƒâ€šÃ‚Â§8.2) -------------------------------------------------------
+
+    def startup_logging(self) -> None:
+        """Initialize logging and log version info."""
+        setup_logging(verbose=self._config.verbose, console=True)
+        logger.info("EVF starting up")
+        self._log_version()
+
+    @staticmethod
+    def _load_imu_camera_alignment(imu_dir: Path) -> np.ndarray | None:
+        """Load a verified telescope-body to camera-body rotation.
+
+        sensor_alignment.json must contain both:
+          mapping_status: "VERIFIED"
+          camera_from_telescope_status: "VERIFIED"
+          camera_from_telescope: proper 3x3 rotation matrix
+
+        The matrix maps telescope-body vectors into camera-body coordinates.
+        """
+        alignment_path = Path(imu_dir) / "sensor_alignment.json"
+        try:
+            with alignment_path.open("r", encoding="utf-8-sig") as stream:
+                alignment = json.load(stream)
+
+            if alignment.get("mapping_status") != "VERIFIED":
+                raise ValueError("IMU sensor-to-telescope mapping is not VERIFIED")
+            if alignment.get("camera_from_telescope_status") != "VERIFIED":
+                raise ValueError("camera_from_telescope calibration is not VERIFIED")
+            if alignment.get("camera_timing_status") != "VERIFIED_EXPOSURE_MIDPOINT":
+                raise ValueError("camera frame clock/timing calibration is not VERIFIED")
+
+            matrix = np.asarray(alignment["camera_from_telescope"], dtype=float)
+            if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
+                raise ValueError("camera_from_telescope must be a finite 3x3 matrix")
+            if not np.allclose(matrix.T @ matrix, np.eye(3), atol=1e-3):
+                raise ValueError("camera_from_telescope rows/columns are not orthonormal")
+            if not np.isclose(np.linalg.det(matrix), 1.0, atol=1e-3):
+                raise ValueError("camera_from_telescope must have determinant +1")
+            return matrix
+        except FileNotFoundError:
+            logger.warning(
+                "IMU pointing propagation disabled: %s is missing",
+                alignment_path,
+            )
+        except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as exc:
+            logger.warning("IMU pointing propagation disabled: %s", exc)
+        return None
+
+    def startup_imu(self) -> None:
+        """Start the optional background telescope IMU reader."""
+        imu_dir = self._config.path.parent / "imu"
+        self._imu_camera_from_telescope = self._load_imu_camera_alignment(imu_dir)
+        self._imu_service = ImuService(imu_dir, port=self._config.imu_port)
+        self._imu_service.start()
+        self._imu_alignment_workflow = ImuAlignmentWorkflow(self._imu_service)
+        self._imu_camera_capture_active = False
+        self._imu_tracking_stop.clear()
+        self._imu_tracking_thread = threading.Thread(
+            target=self._propagate_imu_pointing,
+            name="imu-pointing",
+            daemon=True,
+        )
+        self._imu_tracking_thread.start()
+
+    def startup_solver(self) -> None:
+        """Load tetra3rs database (~1s)."""
+        try:
+            self._solver = PlateSolver()
+        except Exception as exc:
+            logger.error("Failed to load tetra3rs database: %s", exc)
+
+    def startup_stellarium(self) -> None:
+        """Start Stellarium TCP server."""
+        try:
+            self._stellarium = StellariumServer(
+                self._pointing_state,
+                goto_target=self._goto_target,
+                on_client_connected=self._flash_status_led,
+            )
+            self._stellarium.start()
+        except Exception as exc:
+            logger.error("Failed to start Stellarium server: %s", exc)
+            self._stellarium = None
+
+    def startup_lx200(self) -> None:
+        """Start LX200 TCP server.
+
+        Binds 0.0.0.0:4030 so mobile apps (SkySafari, Stellarium Mobile) can
+        reach it on the LAN. Always-on. The reported coordinate epoch follows
+        the lx200.epoch config (JNow standard; J2000 for Stellarium Mobile PLUS).
+        """
+        try:
+            self._lx200 = Lx200Server(
+                self._pointing_state,
+                goto_target=self._goto_target,
+                app_version=self._app_version,
+                report_j2000=(self._config.lx200_epoch == "j2000"),
+                on_client_connected=self._flash_status_led,
+            )
+            self._lx200.start()
+        except Exception as exc:
+            logger.error("Failed to start LX200 server: %s", exc)
+            self._lx200 = None
+
+    def startup_webserver(self) -> None:
+        """Start mobile web interface server."""
+        try:
+            self._webserver = WebServer(
+                self._pointing_state,
+                self._state_machine,
+                self._goto_target,
+                self._config,
+                on_client_connected=self._flash_status_led,
+                frame_buffer=self._frame_buffer,
+                imu_attitude=lambda: self.imu_attitude,
+                imu_snapshot=lambda: self.imu_snapshot,
+                stellarium_object=lambda: self.stellarium_object,
+                camera_controls=lambda: self.camera_controls,
+                sync_state=lambda: {
+                    "in_progress": self.sync_in_progress,
+                    "candidates": [
+                        {"idx": i, "name": f"Star #{i + 1}",
+                         "ra_deg": c.ra, "dec_deg": c.dec, "magnitude": c.mag,
+                         "pixel_x": c.x, "pixel_y": c.y}
+                        for i, c in enumerate(self.sync_candidates or [])
+                    ],
+                    "selected_idx": self.sync_selected_idx,
+                    "error": self.sync_error,
+                },
+                activity=lambda: {
+                    "stellarium": {
+                        "active": self.stellarium_has_client,
+                        "address": self.stellarium_address,
+                        "status": self.stellarium_status,
+                        "object": self.stellarium_object,
+                    },
+                    "lx200": {
+                        "active": self.lx200_active,
+                        "address": self.lx200_address,
+                        "epoch": self._config.lx200_epoch,
+                    },
+                    "webserver": {"url": self.web_url},
+                    "audio_enabled": self.audio_enabled,
+                },
+                stellarium_location=lambda: (
+                    (self.stellarium_status or {}).get("location")
+                    if self.stellarium_status else None
+                ),
+                location=lambda: self.location,
+                dev_mode=self._dev_mode,
+                sample_active=lambda: self._sample_injector.active_name,
+                actions=self,
+            )
+            self._webserver.start()
+        except Exception as exc:
+            logger.error("Failed to start web server: %s", exc)
+            self._webserver = None
+
+    @property
+    def web_url(self) -> str | None:
+        """LAN URL for the mobile web interface, or None if not running."""
+        if self._webserver:
+            return self._webserver.url
+        return None
+
+    def startup_camera(self) -> None:
+        """Spawn camera subprocess, connect, handshake, restore settings.
+
+        On first launch (config has no saved exposure/gain), each control is
+        initialized to the midpoint of the range the camera reports ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â which
+        differs by OS/camera backend, so we can't hardcode sensible defaults.
+
+        With no USB video device attached (Linux), skips spawning
+        camera_server ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â it would only fail and log its allowlist.
+        """
+        if not _usb_video_device_present():
+            self._log_waiting_for_camera()
+            return
+        try:
+            self._subprocess_mgr = SubprocessManager(
+                self._frame_buffer, self._state_machine, self._config
+            )
+            hello = self._subprocess_mgr.start()
+            logger.info("Camera connected: %s", hello)
+            self._camera_wait_logged = False
+
+            client = self._subprocess_mgr.client
+            if client:
+                for ctrl in client.controls:
+                    cid = ctrl.get("id")
+                    if cid not in ("exposure", "gain"):
+                        continue
+                    saved = self._config.exposure if cid == "exposure" else self._config.gain
+                    if saved is None:
+                        cmin = ctrl.get("min", 0)
+                        cmax = ctrl.get("max", 0)
+                        value = (cmin + cmax) // 2
+                        logger.info(
+                            "First-run %s = %d (midpoint of [%d, %d])",
+                            cid, value, cmin, cmax,
+                        )
+                        if cid == "exposure":
+                            self._config.exposure = value
+                        else:
+                            self._config.gain = value
+                    else:
+                        value = saved
+                    client.set_control(cid, value)
+                    client.update_cached_control(cid, value)
+        except Exception as exc:
+            logger.error("Failed to start camera: %s", exc)
+            self._subprocess_mgr = None
+
+    def retry_camera(self) -> bool:
+        """Re-attempt camera startup on demand (e.g. user just plugged it in).
+
+        Idempotent: if a camera is already connected, returns True without
+        doing anything. Otherwise drops any stale SubprocessManager,
+        re-runs startup_camera, and brings up the solver thread on success.
+        Same code path as the initial boot, so the platform-specific risk
+        surface (binary resolution, _kill_stale_server, Popen, handshake)
+        is identical to what already runs once at every launch.
+        Returns the post-attempt camera_connected state.
+        """
+        with self._camera_lock:
+            if self._shutting_down.is_set():
+                return False
+            if self.camera_connected:
+                return True
+            # Stop the stale manager (ends any recovery loop still running)
+            # and drop it so startup_camera builds a fresh one;
+            # _kill_stale_server inside SubprocessManager._spawn_process will
+            # reap any orphaned camera_server left over from the prior failure.
+            stale, self._subprocess_mgr = self._subprocess_mgr, None
+            if stale is not None:
+                try:
+                    stale.stop()
+                except Exception as exc:
+                    logger.warning("Error stopping stale camera manager: %s", exc)
+            self.startup_camera()
+            if not self.camera_connected:
+                return False
+            # Recovery may have left the engine in RECONNECTING / ERROR.
+            if self._state_machine.state in (
+                EngineState.RECONNECTING, EngineState.ERROR
+            ):
+                self._state_machine.transition(EngineState.SETUP)
+            if self._solver_thread is None:
+                self.startup_solver_thread()
+            return True
+
+    def start_camera_watchdog(self, interval_s: float = 10.0) -> None:
+        """Keep retrying the camera in the background (headless mode).
+
+        A headless Pi has no "Retry camera" click to fall back on: the
+        service may boot before the camera is plugged in, and the
+        SubprocessManager's own recovery gives up after 5 attempts. Every
+        `interval_s` this checks for a missing camera and, once a USB
+        video device is present, calls retry_camera(). It stays out of
+        the way while SubprocessManager is mid-recovery.
+        """
+        if self._camera_watchdog is not None:
+            return
+        self._camera_watchdog = threading.Thread(
+            target=self._camera_watchdog_loop,
+            args=(interval_s,),
+            name="camera-watchdog",
+            daemon=True,
+        )
+        self._camera_watchdog.start()
+
+    def start_status_led(self) -> None:
+        """Show engine status on the Pi's LEDs (headless mode).
+
+        Needs LEDs this process may write, which only the
+        pushnav-headless service's root helper (evf.engine.led_helper)
+        sets up; anywhere else this logs one line and does nothing.
+        """
+        if not self._config.led_enabled:
+            logger.info("Status LED: disabled in config (led.enabled)")
+            return
+        leds = find_leds()
+        if not leds:
+            logger.info("Status LED: no writable LEDs, not used")
+            return
+        self._status_led = StatusLedController(
+            lambda: (
+                self._state_machine.state,
+                self.camera_connected,
+                self.consecutive_failures,
+            ),
+            leds,
+        )
+        self._status_led.start()
+        self._goto_target.add_on_change(self._flash_on_new_target)
+        logger.info("Status LED: using %s", ", ".join(sorted(leds)))
+
+    def _flash_status_led(self) -> None:
+        """Brief LED flash for a client connecting or sending a target.
+
+        Called from the server threads; a no-op until start_status_led()
+        has found writable LEDs.
+        """
+        led = self._status_led
+        if led is not None:
+            led.flash()
+
+    def _flash_on_new_target(self) -> None:
+        # GotoTarget also fires on clear(); only a new target flashes.
+        if self._goto_target.read().active:
+            self._flash_status_led()
+
+    def _log_waiting_for_camera(self) -> None:
+        if not self._camera_wait_logged:
+            logger.info("Waiting for camera ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â plug it in to continue")
+            self._camera_wait_logged = True
+
+    def _camera_watchdog_loop(self, interval_s: float) -> None:
+        while not self._shutting_down.wait(interval_s):
+            mgr = self._subprocess_mgr
+            if self.camera_connected or (mgr is not None and mgr.recovering):
+                self._camera_wait_logged = False
+                continue
+            if not _usb_video_device_present():
+                self._log_waiting_for_camera()
+                continue
+            if self.retry_camera():
+                logger.info("Camera connected by watchdog")
+                self._camera_wait_logged = False
+
+    @staticmethod
+    def _imu_quaternion_multiply(a, b):
+        """Hamilton product for [w, x, y, z] quaternions."""
+        aw, ax, ay, az = a
+        bw, bx, by, bz = b
+        return (
+            aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+        )
+
+    @classmethod
+    def _imu_rotate_vector(cls, quaternion, vector):
+        """Rotate a 3-vector by a [w, x, y, z] unit quaternion."""
+        w, x, y, z = quaternion
+        vx, vy, vz = vector
+        qv = (0.0, vx, vy, vz)
+        qc = (w, -x, -y, -z)
+        rotated = cls._imu_quaternion_multiply(
+            cls._imu_quaternion_multiply(quaternion, qv), qc
+        )
+        return rotated[1], rotated[2], rotated[3]
+
+    @classmethod
+    def _imu_propagate_radec(cls, anchor, current_quaternion):
+        """Propagate the telescope boresight through a calibrated sky transform.
+
+        Estimator q maps telescope-body vectors into its fixed local frame.
+        The anchor's telescope_to_sky matrix maps telescope-body vectors at
+        the plate solve into celestial coordinates. Therefore the relative
+        body rotation is inverse(q_anchor) * q_current, not a local-frame
+        delta applied directly to a celestial vector.
+        """
+        q0 = tuple(anchor.quaternion)
+        q1 = tuple(current_quaternion)
+        if len(q0) != 4 or len(q1) != 4:
+            return None
+
+        norm0 = sum(value * value for value in q0) ** 0.5
+        norm1 = sum(value * value for value in q1) ** 0.5
+        if norm0 < 1e-9 or norm1 < 1e-9:
+            return None
+        q0 = tuple(value / norm0 for value in q0)
+        q1 = tuple(value / norm1 for value in q1)
+
+        telescope_to_sky = np.asarray(anchor.telescope_to_sky, dtype=float)
+        if telescope_to_sky.shape != (3, 3) or not np.isfinite(telescope_to_sky).all():
+            return None
+
+        q0_inverse = (q0[0], -q0[1], -q0[2], -q0[3])
+        relative_body = cls._imu_quaternion_multiply(q0_inverse, q1)
+        relative_norm = sum(value * value for value in relative_body) ** 0.5
+        if relative_norm < 1e-9:
+            return None
+        relative_body = tuple(value / relative_norm for value in relative_body)
+
+        # Telescope frame: +X points toward the aperture; +Z is up.
+        current_boresight_body = cls._imu_rotate_vector(
+            relative_body, (1.0, 0.0, 0.0)
+        )
+        sky_vector = telescope_to_sky @ np.asarray(current_boresight_body)
+        sky_norm = float(np.linalg.norm(sky_vector))
+        if sky_norm < 1e-9 or not np.isfinite(sky_norm):
+            return None
+        x, y, z = sky_vector / sky_norm
+
+        import math
+        new_ra = math.degrees(math.atan2(y, x)) % 360.0
+        new_dec = math.degrees(math.atan2(z, math.hypot(x, y)))
+        return new_ra, new_dec
+
+    def _propagate_imu_pointing(self) -> None:
+        """Continuously propagate the last plate solve using relative IMU motion."""
+        import math
+
+        last_key = None
+        while not self._imu_tracking_stop.wait(0.02):
+            service = self._imu_service
+            if service is None:
+                continue
+
+            anchor = self.plate_solve_anchor
+            if anchor is None:
+                continue
+
+            try:
+                snapshot = service.latest_snapshot
+                if snapshot is None:
+                    continue
+                if time.monotonic() - snapshot.received_at_monotonic > 0.25:
+                    with self._plate_solve_anchor_lock:
+                        if self._plate_solve_anchor == anchor:
+                            self._plate_solve_anchor = None
+                    continue
+                if getattr(snapshot, "continuity_id", 0) != getattr(anchor, "continuity_id", 0):
+                    with self._plate_solve_anchor_lock:
+                        if self._plate_solve_anchor == anchor:
+                            self._plate_solve_anchor = None
+                    logger.warning(
+                        "IMU continuity epoch changed; waiting for a fresh plate solve"
+                    )
+                    continue
+
+                key = (anchor.frame_id, snapshot.device_time_us)
+                if key == last_key:
+                    continue
+
+                propagated = self._imu_propagate_radec(
+                    anchor, snapshot.quaternion
+                )
+                if propagated is None:
+                    continue
+
+                ra, dec = propagated
+                if not (math.isfinite(ra) and math.isfinite(dec)):
+                    continue
+
+                applied = self._pointing_state.update_from_imu(
+                    ra,
+                    dec,
+                    expected_last_success_timestamp=anchor.pointing_timestamp,
+                )
+                if applied:
+                    last_key = key
+            except Exception:
+                logger.exception("IMU pointing propagation failed")
+
+    def _capture_plate_solve_anchor(
+        self, pointing: PointingSnapshot, frame_timestamp: float, frame_id: int,
+        frame_metadata=None,
+    ) -> None:
+        """Pair a plate solve with IMU orientation and a verified body transform."""
+        workflow = self._imu_alignment_workflow
+        if (
+            workflow is not None
+            and self._imu_camera_capture_active
+            and pointing.valid
+        ):
+            try:
+                workflow.capture_camera_pair(
+                    pointing, frame_timestamp, frame_id, frame_metadata
+                )
+            except Exception as exc:
+                logger.debug("IMU camera calibration pair rejected: %s", exc)
+
+        service = self._imu_service
+        camera_from_telescope = self._imu_camera_from_telescope
+
+        sensor_mapping_verified = bool(
+            service is not None
+            and getattr(service, "sensor_mapping_verified", False)
+        )
+
+        timing_quality = getattr(frame_metadata, "timestamp_quality", "untrusted")
+        timing_clock_verified = bool(
+            getattr(frame_metadata, "clock_sync_verified", False)
+        )
+        if (
+            not pointing.valid
+            or service is None
+            or not sensor_mapping_verified
+            or camera_from_telescope is None
+            or timing_quality != "callback"
+            or not timing_clock_verified
+        ):
+            with self._plate_solve_anchor_lock:
+                self._plate_solve_anchor = None
+            logger.debug(
+                "Plate-solve IMU anchor unavailable: verified sensor and "
+                "camera/telescope alignment is required"
+            )
+            return
+
+        orientation = service.orientation_at_host_time(frame_timestamp)
+        if orientation is None:
+            with self._plate_solve_anchor_lock:
+                self._plate_solve_anchor = None
+            logger.debug(
+                "Plate-solve anchor unavailable: no initialized IMU orientation "
+                "bracketing the camera-frame timestamp"
+            )
+            return
+
+        device_time_us, quaternion = orientation
+        current_snapshot = service.latest_snapshot
+        if current_snapshot is None:
+            with self._plate_solve_anchor_lock:
+                self._plate_solve_anchor = None
+            return
+        camera_to_sky = orientation_from_radec_roll(
+            pointing.ra_j2000, pointing.dec_j2000, pointing.roll
+        )
+        telescope_to_sky = camera_to_sky @ camera_from_telescope
+
+        anchor = PlateSolveAnchor(
+            ra_j2000=pointing.ra_j2000,
+            dec_j2000=pointing.dec_j2000,
+            roll=pointing.roll,
+            pointing_timestamp=pointing.last_success_timestamp,
+            frame_timestamp=frame_timestamp,
+            frame_id=frame_id,
+            quaternion=tuple(quaternion),
+            imu_device_time_us=device_time_us,
+            telescope_to_sky=tuple(
+                tuple(float(value) for value in row)
+                for row in telescope_to_sky
+            ),
+            continuity_id=getattr(current_snapshot, "continuity_id", 0),
+        )
+        with self._plate_solve_anchor_lock:
+            self._plate_solve_anchor = anchor
+
+    def startup_solver_thread(self) -> None:
+        """Create solver thread object (not started until user enables tracking)."""
+        if self._solver:
+            self._audio = AudioAlert(enabled=self._config.audio_enabled)
+            self._solver_thread = SolverThread(
+                self._solver,
+                self._frame_buffer,
+                self._pointing_state,
+                self._state_machine,
+                self._config,
+                audio=self._audio,
+                on_plate_solve=self._capture_plate_solve_anchor,
+            )
+            # Wire solver failure count into web server for audio event detection
+            if self._webserver is not None:
+                self._webserver._solver_failures = lambda: self.consecutive_failures
+
+    # -- tracking lifecycle (Ãƒâ€šÃ‚Â§8.3) --------------------------------------------
+
+    def skip_calibration(self) -> None:
+        """Skip finder rotation calibration, proceed to tracking."""
+        if self._state_machine.state == EngineState.CALIBRATE:
+            if self._solver_thread:
+                self._solver_thread.skip_calibrate()
+
+    def use_previous_calibration(self) -> None:
+        """Restore saved sync + finder rotation from config and start tracking.
+
+        Only valid from SYNC state when config has saved calibration data.
+        """
+        if not self.camera_connected:
+            logger.info("use_previous_calibration ignored ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â camera not connected")
+            return
+        if self._state_machine.state != EngineState.SYNC:
+            return
+        if not self._config.has_calibration:
+            return
+        if not self._solver_thread:
+            logger.error("No solver thread available")
+            return
+        d_body = np.array(self._config.sync_d_body)
+        self._solver_thread.set_sync_d_body(d_body)
+        logger.info(
+            "Using previous calibration: d_body=(%.6f, %.6f, %.6f) "
+            "finder_rotation=%.1fÃƒâ€šÃ‚Â°",
+            d_body[0], d_body[1], d_body[2],
+            self._config.finder_rotation,
+        )
+        self._solver_thread.start()  # SYNC ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ WARMING_UP
+
+    def calibrate_imu_stationary(self) -> None:
+        """Run stationary gyro calibration using the active IMU stream."""
+        service = self._imu_service
+        if service is None:
+            raise RuntimeError("IMU is not running")
+        service.calibrate_stationary_gyro()
+
+    def imu_alignment_workflow_status(self) -> dict:
+        workflow = self._imu_alignment_workflow
+        if workflow is None:
+            return {"available": False, "error": "IMU workflow is not running"}
+        result = workflow.status()
+        result["available"] = True
+        result["camera_capture_active"] = self._imu_camera_capture_active
+        return result
+
+    def imu_alignment_start_sweep(self, axis: str, direction: int) -> dict:
+        workflow = self._imu_alignment_workflow
+        if workflow is None:
+            raise RuntimeError("IMU workflow is not running")
+        workflow.start_sensor_sweep(axis, direction)
+        return self.imu_alignment_workflow_status()
+
+    def imu_alignment_finish_sweep(self) -> dict:
+        workflow = self._imu_alignment_workflow
+        if workflow is None:
+            raise RuntimeError("IMU workflow is not running")
+        return workflow.finish_sensor_sweep()
+
+    def imu_alignment_fit_sensor(self) -> dict:
+        workflow = self._imu_alignment_workflow
+        service = self._imu_service
+        if workflow is None or service is None:
+            raise RuntimeError("IMU workflow is not running")
+        result = workflow.fit_sensor_alignment()
+        service.set_sensor_to_telescope(result["matrix"])
+        # Do not combine a newly fitted sensor transform with an old camera
+        # transform. Propagation stays disabled until camera fit is finalized.
+        self._imu_camera_from_telescope = None
+        with self._plate_solve_anchor_lock:
+            self._plate_solve_anchor = None
+        return result
+
+    def imu_alignment_camera_capture(self, active: bool) -> dict:
+        workflow = self._imu_alignment_workflow
+        if workflow is None:
+            raise RuntimeError("IMU workflow is not running")
+        if active and workflow.status()["sensor_fit"] is None:
+            raise ValueError("Fit sensor axes before collecting camera pairs")
+        self._imu_camera_capture_active = bool(active)
+        return self.imu_alignment_workflow_status()
+
+    def imu_alignment_fit_camera(self) -> dict:
+        workflow = self._imu_alignment_workflow
+        if workflow is None:
+            raise RuntimeError("IMU workflow is not running")
+        self._imu_camera_capture_active = False
+        return workflow.fit_camera_alignment()
+
+    def imu_alignment_reset(self) -> dict:
+        workflow = self._imu_alignment_workflow
+        if workflow is None:
+            raise RuntimeError("IMU workflow is not running")
+        self._imu_camera_capture_active = False
+        workflow.reset()
+        return self.imu_alignment_workflow_status()
+
+    def finalize_imu_alignment(self) -> dict:
+        workflow = self._imu_alignment_workflow
+        service = self._imu_service
+        if workflow is None or service is None:
+            raise RuntimeError("IMU workflow is not running")
+        measured = workflow.measured_result()
+        timing_evidence = measured.get("camera_timing_evidence")
+        uncertainty = (
+            timing_evidence.get("timing_uncertainty_s")
+            if isinstance(timing_evidence, dict) else None
+        )
+        if (
+            not isinstance(timing_evidence, dict)
+            or measured.get("calibration_method") != "physical_sweeps_and_paired_plate_solves_v2"
+            or timing_evidence.get("exposure_midpoint_verified") is not True
+            or not isinstance(uncertainty, (int, float))
+            or not np.isfinite(uncertainty)
+            or uncertainty < 0.0
+            or uncertainty > 0.010
+        ):
+            raise RuntimeError(
+                "Physical finalization blocked: require genuine exposure-midpoint "
+                "verification with finite timing uncertainty <= 10 ms. A QPC "
+                "SampleCB callback timestamp or synthetic evidence is insufficient."
+            )
+        sensor_matrix = np.asarray(measured["sensor_to_telescope"], dtype=float)
+        camera_matrix = np.asarray(measured["camera_from_telescope"], dtype=float)
+        if not getattr(service, "sensor_mapping_verified", False):
+            raise RuntimeError("Sensor mapping is not applied and verified")
+
+        imu_dir = self._config.path.parent / "imu"
+        imu_dir.mkdir(parents=True, exist_ok=True)
+        alignment_path = imu_dir / "sensor_alignment.json"
+        existing = {}
+        if alignment_path.exists():
+            try:
+                with alignment_path.open("r", encoding="utf-8-sig") as handle:
+                    existing = json.load(handle)
+                if not isinstance(existing, dict):
+                    raise ValueError("Existing alignment must be a JSON object")
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"Cannot preserve existing alignment: {exc}") from exc
+
+        existing.update({
+            "sensor_to_telescope": sensor_matrix.tolist(),
+            "mapping_status": "VERIFIED",
+            "camera_from_telescope": camera_matrix.tolist(),
+            "camera_from_telescope_status": "VERIFIED",
+            "camera_timing_status": "VERIFIED_EXPOSURE_MIDPOINT",
+            "camera_timing_note": (
+                "QPC timestamp is sampled in DirectShow SampleCB. This verifies "
+                "the host clock domain, not sensor exposure midpoint; perform "
+                "physical stationary/motion validation before relying on tracking."
+            ),
+            "calibration_evidence": measured,
+        })
+        temp_name = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=imu_dir,
+                prefix="sensor_alignment.", suffix=".tmp", delete=False,
+            ) as handle:
+                temp_name = handle.name
+                json.dump(existing, handle, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, alignment_path)
+        except Exception:
+            if temp_name and os.path.exists(temp_name):
+                os.unlink(temp_name)
+            raise
+
+        self._imu_camera_from_telescope = camera_matrix
+        self._imu_camera_capture_active = False
+        with self._plate_solve_anchor_lock:
+            self._plate_solve_anchor = None
+        return {"saved": True, "evidence": measured}
+
+    def imu_alignment_status(self) -> dict:
+        """Return persisted transforms together with verified live runtime state."""
+        alignment_path = self._config.path.parent / "imu" / "sensor_alignment.json"
+        saved = {}
+        try:
+            with alignment_path.open("r", encoding="utf-8-sig") as handle:
+                value = json.load(handle)
+            if isinstance(value, dict):
+                saved = value
+        except (OSError, ValueError, TypeError):
+            pass
+
+        service = self._imu_service
+        sensor_verified = bool(
+            service is not None
+            and getattr(service, "sensor_mapping_verified", False)
+        )
+        camera_verified = self._imu_camera_from_telescope is not None
+
+        with self._plate_solve_anchor_lock:
+            anchor_available = self._plate_solve_anchor is not None
+
+        thread = self._imu_tracking_thread
+        tracking_active = bool(thread is not None and thread.is_alive())
+
+        snapshot_available = False
+        if service is not None:
+            try:
+                snapshot_available = service.latest_snapshot is not None
+            except Exception:
+                snapshot_available = False
+
+        return {
+            "sensor_mapping_status": (
+                "VERIFIED" if sensor_verified else "UNVERIFIED"
+            ),
+            "camera_alignment_status": (
+                "VERIFIED" if camera_verified else "UNVERIFIED"
+            ),
+            "camera_timing_status": saved.get(
+                "camera_timing_status", "UNVERIFIED"
+            ),
+            "sensor_to_telescope": (
+                saved.get("sensor_to_telescope") if sensor_verified else None
+            ),
+            "camera_from_telescope": (
+                self._imu_camera_from_telescope.tolist()
+                if camera_verified else None
+            ),
+            "celestial_propagation_enabled": bool(
+                sensor_verified
+                and camera_verified
+                and tracking_active
+                and snapshot_available
+                and anchor_available
+            ),
+        }
+
+    def save_imu_alignment(
+        self,
+        sensor_to_telescope,
+        camera_from_telescope,
+        confirm_physical_alignment: bool,
+    ) -> None:
+        """Reject manual matrix submission; calibration must be evidence-based."""
+        raise ValueError(
+            "Manual alignment matrices are disabled. Use the guided physical "
+            "sweep and paired plate-solve calibration workflow."
+        )
+
+    def step_advance(self) -> None:
+        """Advance the wizard: SETUP ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ SYNC ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ SYNC_CONFIRM ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ CALIBRATE ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ WARMING_UP, or stop."""
+        state = self._state_machine.state
+        logger.info("step_advance called, state=%s", state.value)
+        # Every forward step needs camera frames. Only the "stop tracking"
+        # branch (WARMING_UP/TRACKING ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ SETUP) works without a camera.
+        if not self.camera_connected and state not in (
+            EngineState.WARMING_UP, EngineState.TRACKING,
+        ):
+            logger.info("step_advance ignored ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â camera not connected")
+            return
+        if state == EngineState.SETUP:
+            self._state_machine.transition(EngineState.SYNC)
+        elif state == EngineState.SYNC:
+            if not self._solver:
+                logger.error("No solver available")
+                return
+            if not self._sync_lock.acquire(blocking=False):
+                return  # solve already in progress
+            self._sync_error = None
+            threading.Thread(
+                target=self._perform_sync_solve, name="sync-solve", daemon=True
+            ).start()
+        elif state == EngineState.SYNC_CONFIRM:
+            self._confirm_sync()
+        elif state == EngineState.CALIBRATE:
+            self.skip_calibration()
+        elif state in (EngineState.WARMING_UP, EngineState.TRACKING):
+            if self._solver_thread:
+                self._solver_thread.stop()
+                self._solver_thread.set_sync_d_body(None)
+            self._clear_sync_data()
+            state = self._state_machine.state
+            if state in (EngineState.WARMING_UP, EngineState.TRACKING):
+                self._state_machine.transition(EngineState.SETUP)
+
+    # -- two-phase sync -------------------------------------------------------
+
+    def _perform_sync_solve(self) -> None:
+        """Background thread: solve frame, build candidates, transition to SYNC_CONFIRM."""
+        try:
+            frame_data, _, _ = self._frame_buffer.get()
+            if frame_data is None:
+                self._sync_error = "No camera frame available"
+                return
+            result = self._solver.solve_frame(frame_data)
+            if not PlateSolver.is_valid(
+                result, self._config.min_matches, self._config.max_prob
+            ):
+                self._sync_error = (
+                    "Plate solve failed \u2014 ensure stars are visible and retry"
+                )
+                return
+            candidates = build_sync_candidates(
+                result["matched_centroids"],
+                result["matched_stars"],
+                result["image_size"],
+            )
+            if not candidates:
+                self._sync_error = (
+                    "No suitable stars found \u2014 adjust framing and retry"
+                )
+                return
+            self._sync_candidates = candidates
+            self._sync_selected_idx = auto_select(candidates, result["image_size"])
+            self._sync_camera_ra = result["RA"]
+            self._sync_camera_dec = result["Dec"]
+            self._sync_camera_roll = result["Roll"]
+            self._state_machine.transition(EngineState.SYNC_CONFIRM)
+        except Exception as exc:
+            logger.error("Sync solve failed: %s", exc)
+            self._sync_error = str(exc)
+        finally:
+            self._sync_lock.release()
+
+    def _confirm_sync(self) -> None:
+        """Compute body-frame sync from single point and start calibration."""
+        if not self._sync_candidates or self._sync_selected_idx is None:
+            return
+        if not self._solver_thread:
+            logger.error("No solver thread available")
+            return
+        target = self._sync_candidates[self._sync_selected_idx]
+        d_body = compute_body_frame_sync(
+            self._sync_camera_ra,
+            self._sync_camera_dec,
+            self._sync_camera_roll,
+            target.ra,
+            target.dec,
+        )
+        logger.info(
+            "Body-frame sync: cam=(%.4f, %.4f, roll=%.1f) "
+            "target=(%.4f, %.4f) star_mag=%.1f d_body=(%.6f, %.6f, %.6f)",
+            self._sync_camera_ra, self._sync_camera_dec, self._sync_camera_roll,
+            target.ra, target.dec, target.mag,
+            d_body[0], d_body[1], d_body[2],
+        )
+        self._solver_thread.set_sync_d_body(d_body)
+        self._config.sync_d_body = d_body.tolist()
+        self._solver_thread.start_calibrate(
+            self._sync_camera_ra,
+            self._sync_camera_dec,
+            self._sync_camera_roll,
+        )  # SYNC_CONFIRM ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ CALIBRATE
+
+    def sync_retry(self) -> None:
+        """Go back to SYNC to redo the current solve (preserves earlier pairs)."""
+        if self._state_machine.state == EngineState.SYNC_CONFIRM:
+            self._sync_candidates = None
+            self._sync_selected_idx = None
+            self._sync_error = None
+            self._state_machine.transition(EngineState.SYNC)
+
+    def set_sync_selected(self, idx: int) -> None:
+        """Called by UI when user taps a candidate."""
+        if self._sync_candidates and 0 <= idx < len(self._sync_candidates):
+            self._sync_selected_idx = idx
+
+    def _clear_sync_data(self) -> None:
+        self._sync_candidates = None
+        self._sync_selected_idx = None
+        self._sync_error = None
+
+    @property
+    def sync_candidates(self) -> list[SyncCandidate] | None:
+        return self._sync_candidates
+
+    @property
+    def sync_selected_idx(self) -> int | None:
+        return self._sync_selected_idx
+
+    @property
+    def sync_error(self) -> str | None:
+        return self._sync_error
+
+    @property
+    def sync_in_progress(self) -> bool:
+        return self._sync_lock.locked()
+
+    # -- camera control (Ãƒâ€šÃ‚Â§8.4) ------------------------------------------------
+
+    def set_control(self, control_id: str, value: int) -> None:
+        """Send a camera control change and persist to config."""
+        client = self._subprocess_mgr.client if self._subprocess_mgr else None
+        if client:
+            client.set_control(control_id, value)
+        # Persist to config
+        if control_id == "exposure":
+            self._config.exposure = value
+        elif control_id == "gain":
+            self._config.gain = value
+
+    # -- shutdown (Ãƒâ€šÃ‚Â§8.5) ------------------------------------------------------
+
+    def shutdown(self) -> None:
+        """Graceful shutdown. Each step with independent timeout."""
+        logger.info("Shutting down")
+        self._shutting_down.set()
+
+        # 0a. Stop the status LED first so it can't show a stale state while
+        # subsystems go down (the service's ExecStopPost restores the LEDs).
+        if self._status_led:
+            try:
+                self._status_led.stop()
+            except Exception as exc:
+                logger.error("Error stopping status LED: %s", exc)
+
+        # 0. Stop sample injector (so it stops writing frames before solver stops)
+        try:
+            self._sample_injector.stop()
+        except Exception as exc:
+            logger.error("Error stopping sample injector: %s", exc)
+
+        # 1. Stop solver thread
+        if self._solver_thread:
+            try:
+                self._solver_thread.stop(timeout=2)
+            except Exception as exc:
+                logger.error("Error stopping solver: %s", exc)
+
+        # 1b. Stop IMU pointing propagation before its source service.
+        self._imu_tracking_stop.set()
+        if self._imu_tracking_thread:
+            self._imu_tracking_thread.join(timeout=1.0)
+            self._imu_tracking_thread = None
+
+        # 1c. Stop IMU reader
+        if self._imu_service:
+            try:
+                self._imu_service.stop()
+            except Exception as exc:
+                logger.error("Error stopping IMU: %s", exc)
+
+        # 2. Stop Stellarium server
+        if self._stellarium:
+            try:
+                self._stellarium.stop(timeout=2)
+            except Exception as exc:
+                logger.error("Error stopping Stellarium: %s", exc)
+
+        # 2b. Stop LX200 server
+        if self._lx200:
+            try:
+                self._lx200.stop(timeout=2)
+            except Exception as exc:
+                logger.error("Error stopping LX200 server: %s", exc)
+
+        # 3a. Stop web server
+        if self._webserver:
+            try:
+                self._webserver.stop(timeout=2)
+            except Exception as exc:
+                logger.error("Error stopping web server: %s", exc)
+
+        # 3. Terminate camera subprocess. Taking _camera_lock waits out any
+        # retry already in flight (_shutting_down refuses new ones), so no
+        # camera_server can be spawned after we've stopped the manager.
+        locked = self._camera_lock.acquire(timeout=30)
+        try:
+            if self._subprocess_mgr:
+                try:
+                    self._subprocess_mgr.stop()
+                except Exception as exc:
+                    logger.error("Error stopping camera: %s", exc)
+        finally:
+            if locked:
+                self._camera_lock.release()
+
+        # 4. Save config
+        try:
+            self._config.save()
+        except Exception as exc:
+            logger.error("Error saving config: %s", exc)
+
+        # 5. Flush logs
+        logger.info("Shutdown complete")
+        logging.shutdown()
+
+    # -- internal -------------------------------------------------------------
+
+    def _log_version(self) -> None:
+        try:
+            with open(_VERSION_PATH) as f:
+                version = json.load(f)
+            logger.info("EVF version: %s", version)
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            logger.warning("Could not read VERSION.json: %s", exc)
+
+
+
+====================================================================================================
+FILE: python\evf\imu\alignment_workflow.py  [keyword score=6]
+====================================================================================================
+"""Evidence-based calibration workflow for the PushNav telescope IMU."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+import json
+from pathlib import Path
+import threading
+import time
+
+import numpy as np
+
+from evf.imu.alignment_calibration import (
+    camera_from_telescope_from_pairs,
+    sensor_to_telescope_from_sweep_axes,
+)
+from evf.solver.sync import orientation_from_radec_roll
+
+
+@dataclass(frozen=True)
+class SensorSweep:
+    axis: str
+    direction: int
+    sensor_axis: tuple[float, float, float]
+    sample_count: int
+    duration_s: float
+    integrated_angle_deg: float
+    gyro_noise_dps: float
+    started_at: float
+    finished_at: float
+
+
+@dataclass(frozen=True)
+class CameraPair:
+    frame_id: int
+    frame_timestamp: float
+    device_time_us: int
+    quaternion: tuple[float, float, float, float]
+    camera_to_sky: tuple[tuple[float, float, float], ...]
+    timestamp_quality: str = "untrusted"
+    clock_sync_verified: bool = False
+    timing_uncertainty_s: float | None = None
+
+
+class ImuAlignmentWorkflow:
+    """Collect and validate actual physical alignment measurements."""
+
+    MIN_SWEEP_SAMPLES = 50
+    MIN_SWEEP_ANGLE_DEG = 8.0
+    MIN_SWEEP_DURATION_S = 1.0
+    MAX_SWEEP_DURATION_S = 30.0
+    MAX_SWEEP_NOISE_DPS = 3.0
+    MIN_CAMERA_PAIRS = 4
+    MAX_SENSOR_RMS_DEG = 5.0
+    MAX_CAMERA_RMS_DEG = 3.0
+    MIN_CAMERA_PAIR_SEPARATION_DEG = 5.0
+
+    def __init__(self, service):
+        self.service = service
+        self._lock = threading.RLock()
+        self._active_sweep = None
+        self._sweeps = []
+        self._camera_pairs = []
+        self._sensor_fit = None
+        self._camera_fit = None
+
+    def status(self):
+        with self._lock:
+            return {
+                "active_sweep": (
+                    {
+                        "axis": self._active_sweep["axis"],
+                        "direction": self._active_sweep["direction"],
+                        "elapsed_s": max(
+                            0.0, time.monotonic() -
+                            self._active_sweep["started_at"]
+                        ),
+                    }
+                    if self._active_sweep else None
+                ),
+                "sensor_sweep_count": len(self._sweeps),
+                "sensor_sweeps": [
+                    {
+                        "axis": item.axis,
+                        "direction": item.direction,
+                        "sample_count": item.sample_count,
+                        "duration_s": item.duration_s,
+                        "integrated_angle_deg": item.integrated_angle_deg,
+                        "gyro_noise_dps": item.gyro_noise_dps,
+                    }
+                    for item in self._sweeps
+                ],
+                "camera_pair_count": len(self._camera_pairs),
+                "trusted_camera_pair_count": sum(
+                    item.timestamp_quality == "callback" and item.clock_sync_verified
+                    for item in self._camera_pairs
+                ),
+                "sensor_fit": self._sensor_fit,
+                "camera_fit": self._camera_fit,
+                "camera_timing_ready": (
+                    len(self._camera_pairs) >= self.MIN_CAMERA_PAIRS
+                    and all(
+                        item.timestamp_quality == "callback"
+                        and item.clock_sync_verified
+                        for item in self._camera_pairs
+                    )
+                ),
+                "ready_to_finalize": (
+                    self._sensor_fit is not None
+                    and self._camera_fit is not None
+                    and len(self._camera_pairs) >= self.MIN_CAMERA_PAIRS
+                    and all(
+                        item.timestamp_quality == "callback"
+                        and item.clock_sync_verified
+                        for item in self._camera_pairs
+                    )
+                ),
+            }
+
+    def start_sensor_sweep(self, axis: str, direction: int):
+        axis = str(axis).lower()
+        if axis not in ("altitude", "azimuth"):
+            raise ValueError("axis must be altitude or azimuth")
+        if direction not in (-1, 1):
+            raise ValueError("direction must be -1 or +1")
+
+        if self.service is None or self.service.stream is None:
+            raise RuntimeError("IMU stream is not running")
+
+        with self._lock:
+            if self._active_sweep is not None:
+                raise RuntimeError("A sensor sweep is already active")
+
+            self._active_sweep = {
+                "axis": axis,
+                "direction": int(direction),
+                "started_at": time.monotonic(),
+                "device_start_us": (
+                    self.service.stream.history.latest().device_time_us
+                    if self.service.stream.history.latest() else None
+                ),
+            }
+
+    def finish_sensor_sweep(self):
+        with self._lock:
+            active = self._active_sweep
+            if active is None:
+                raise RuntimeError("No sensor sweep is active")
+            self._active_sweep = None
+
+        finished = time.monotonic()
+        duration = finished - active["started_at"]
+        if not self.MIN_SWEEP_DURATION_S <= duration <= self.MAX_SWEEP_DURATION_S:
+            raise ValueError(
+                f"Sweep duration must be between "
+                f"{self.MIN_SWEEP_DURATION_S:.0f} and "
+                f"{self.MAX_SWEEP_DURATION_S:.0f} seconds"
+            )
+
+        records = self.service.stream.history.samples_between(
+            active["started_at"], finished
+        )
+        if len(records) < self.MIN_SWEEP_SAMPLES:
+            raise ValueError(
+                f"Insufficient sweep samples: {len(records)}; "
+                f"need at least {self.MIN_SWEEP_SAMPLES}"
+            )
+
+        # Use the device clock for integration; receipt timestamps select
+        # the capture window but are not substituted for device time.
+        records = sorted(records, key=lambda item: item.device_time_us)
+        times = np.asarray(
+            [item.device_time_us for item in records], dtype=float
+        ) / 1_000_000.0
+        gyro = np.asarray(
+            [item.sample.gyro_dps for item in records], dtype=float
+        )
+
+        if not np.isfinite(gyro).all():
+            raise ValueError("Sweep contains non-finite gyro samples")
+
+        dt = np.diff(times)
+        if np.any(dt <= 0) or np.any(dt > 0.1):
+            raise ValueError("Sweep has invalid or discontinuous device timestamps")
+
+        # Use the independently measured stationary gyro calibration. Do not
+        # estimate bias from the sweep itself: a telescope still moving at
+        # either endpoint would otherwise be mistaken for sensor bias.
+        calibration_path = Path(self.service.config_dir) / "imu_calibration.json"
+        try:
+            with calibration_path.open("r", encoding="utf-8-sig") as handle:
+                calibration = json.load(handle)
+            bias = np.asarray(calibration["gyro_bias_dps"], dtype=float)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError(
+                "Run stationary gyroscope calibration before axis sweeps"
+            ) from exc
+        if bias.shape != (3,) or not np.isfinite(bias).all():
+            raise ValueError("Saved gyro bias must contain three finite values")
+        corrected = gyro - bias
+
+        edge_count = max(10, len(gyro) // 10)
+        edge_magnitudes = np.linalg.norm(
+            np.vstack((corrected[:edge_count], corrected[-edge_count:])),
+            axis=1,
+        )
+        if (
+            float(np.median(edge_magnitudes)) > 2.0
+            or float(np.percentile(edge_magnitudes, 90)) > 5.0
+        ):
+            raise ValueError(
+                "Keep the telescope stationary at the beginning and end "
+                "of each sweep"
+            )
+
+        magnitudes = np.linalg.norm(corrected, axis=1)
+        moving = magnitudes >= 1.0
+        if int(np.count_nonzero(moving)) < self.MIN_SWEEP_SAMPLES // 2:
+            raise ValueError(
+                "Not enough moving gyro samples; make a deliberate, "
+                "continuous telescope sweep"
+            )
+
+        moving_vectors = corrected[moving]
+        # Robustly estimate the signed axis from all moving samples. Reject
+        # sweeps that reverse or wander rather than averaging them into a
+        # misleading direction.
+        axis_vector = np.median(moving_vectors, axis=0)
+        axis_norm = float(np.linalg.norm(axis_vector))
+        if axis_norm < 1.0:
+            raise ValueError("Measured sweep axis is too weak")
+
+        sensor_axis = (axis_vector * active["direction"]) / axis_norm
+        projections = corrected @ sensor_axis
+        moving_projection = projections[moving]
+        aligned_fraction = float(np.mean(
+            moving_projection * active["direction"] > 0.0
+        ))
+        if aligned_fraction < 0.85:
+            raise ValueError(
+                "Sweep direction reversed or was inconsistent; capture one "
+                "continuous motion in the requested direction"
+            )
+        perpendicular = corrected - projections[:, None] * sensor_axis
+        gyro_noise = float(np.median(np.linalg.norm(
+            perpendicular[moving], axis=1
+        )))
+
+        if gyro_noise > self.MAX_SWEEP_NOISE_DPS:
+            raise ValueError(
+                f"Sweep gyro noise too high ({gyro_noise:.2f} dps)"
+            )
+
+        # Integrate angular speed over device-clock intervals. The measured
+        # direction is retained in sensor_axis; the target direction is
+        # selected explicitly by the operator.
+        # Integrate signed angular velocity projected onto the fitted axis.
+        # Keep rate and dt arrays aligned across every timestamp interval.
+        signed_rate = projections * active["direction"]
+        interval_rate = 0.5 * (signed_rate[:-1] + signed_rate[1:])
+        integrated = float(np.sum(np.maximum(interval_rate, 0.0) * dt))
+        if integrated < self.MIN_SWEEP_ANGLE_DEG:
+            raise ValueError(
+                f"Sweep moved only {integrated:.1f} degrees; "
+                f"need at least {self.MIN_SWEEP_ANGLE_DEG:.0f}"
+            )
+
+        result = SensorSweep(
+            axis=active["axis"],
+            direction=active["direction"],
+            sensor_axis=tuple(float(v) for v in sensor_axis),
+            sample_count=len(records),
+            duration_s=duration,
+            integrated_angle_deg=integrated,
+            gyro_noise_dps=gyro_noise,
+            started_at=active["started_at"],
+            finished_at=finished,
+        )
+
+        with self._lock:
+            self._sweeps.append(result)
+            self._sensor_fit = None
+
+        return self.status()
+
+    def fit_sensor_alignment(self):
+        with self._lock:
+            sweeps = tuple(self._sweeps)
+
+        for axis in ("altitude", "azimuth"):
+            directions = {
+                item.direction for item in sweeps if item.axis == axis
+            }
+            if directions != {-1, 1}:
+                raise ValueError(
+                    f"Capture both positive and negative {axis} sweeps"
+                )
+
+        # Positive and negative telescope movements must identify the
+        # same canonical sensor axis. A reversed operator movement would
+        # otherwise be silently absorbed into the fitted sensor transform.
+        for axis in ("altitude", "azimuth"):
+            positive = [
+                np.asarray(item.sensor_axis, dtype=float)
+                for item in sweeps
+                if item.axis == axis and item.direction == 1
+            ]
+            negative = [
+                np.asarray(item.sensor_axis, dtype=float)
+                for item in sweeps
+                if item.axis == axis and item.direction == -1
+            ]
+
+            positive_axis = np.mean(positive, axis=0)
+            negative_axis = np.mean(negative, axis=0)
+
+            positive_norm = float(np.linalg.norm(positive_axis))
+            negative_norm = float(np.linalg.norm(negative_axis))
+
+            if positive_norm < 1e-8 or negative_norm < 1e-8:
+                raise ValueError(
+                    f"Insufficient directional consistency for {axis}"
+                )
+
+            alignment = float(
+                np.dot(
+                    positive_axis / positive_norm,
+                    negative_axis / negative_norm,
+                )
+            )
+
+            if alignment < 0.90:
+                raise ValueError(
+                    f"Positive and negative {axis} sweeps disagree "
+                    f"(axis alignment {alignment:.3f}); repeat the "
+                    "sweeps in their requested directions"
+                )
+
+        source = []
+        target = []
+        for item in sweeps:
+            source.append(item.sensor_axis)
+            if item.axis == "altitude":
+                target.append((0.0, -1.0, 0.0))
+            else:
+                target.append((0.0, 0.0, 1.0))
+
+        matrix, rms, errors = sensor_to_telescope_from_sweep_axes(
+            source, target
+        )
+        if rms > self.MAX_SENSOR_RMS_DEG:
+            raise ValueError("Sensor alignment residual exceeds limit")
+
+        result = {
+            "matrix": matrix.tolist(),
+            "rms_deg": float(rms),
+            "residuals_deg": [float(v) for v in errors],
+            "sweep_count": len(sweeps),
+            "sample_count": sum(item.sample_count for item in sweeps),
+            "axes": ["altitude", "azimuth"],
+        }
+        with self._lock:
+            self._sensor_fit = result
+        return result
+
+    def capture_camera_pair(
+        self, pointing, frame_timestamp: float, frame_id: int, frame_metadata=None
+    ):
+        """Pair a solve with IMU orientation at a synchronized camera callback time."""
+        if self.service is None:
+            raise RuntimeError("IMU service is not running")
+        if frame_metadata is None:
+            raise ValueError("Camera frame has no timestamp provenance")
+        if getattr(frame_metadata, "timestamp_quality", "untrusted") != "callback":
+            raise ValueError("Camera frame timestamp is not a native callback timestamp")
+        if not getattr(frame_metadata, "clock_sync_verified", False):
+            raise ValueError("Camera QPC clock has not been synchronized to host monotonic")
+
+        orientation = self.service.orientation_at_host_time(frame_timestamp)
+        if orientation is None:
+            raise ValueError(
+                "No initialized IMU orientation brackets this camera frame"
+            )
+
+        device_time_us, quaternion = orientation
+        camera_matrix = orientation_from_radec_roll(
+            pointing.ra_j2000,
+            pointing.dec_j2000,
+            pointing.roll,
+        )
+
+        pair = CameraPair(
+            frame_id=int(frame_id),
+            frame_timestamp=float(frame_timestamp),
+            device_time_us=int(device_time_us),
+            quaternion=tuple(float(v) for v in quaternion),
+            camera_to_sky=tuple(
+                tuple(float(v) for v in row) for row in camera_matrix
+            ),
+            timestamp_quality=frame_metadata.timestamp_quality,
+            clock_sync_verified=bool(frame_metadata.clock_sync_verified),
+            timing_uncertainty_s=frame_metadata.timing_uncertainty_s,
+        )
+
+        with self._lock:
+            if any(item.frame_id == pair.frame_id for item in self._camera_pairs):
+                return self.status()
+            # One pair per materially distinct pointing pose. This prevents a
+            # stationary scope producing dozens of nearly identical solves
+            # and dominating the camera/telescope rotation fit.
+            new_matrix = np.asarray(pair.camera_to_sky, dtype=float)
+            for existing in self._camera_pairs:
+                old_matrix = np.asarray(existing.camera_to_sky, dtype=float)
+                relative = old_matrix.T @ new_matrix
+                cosine = float(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0))
+                separation = math.degrees(math.acos(cosine))
+                if separation < self.MIN_CAMERA_PAIR_SEPARATION_DEG:
+                    return self.status()
+            self._camera_pairs.append(pair)
+            self._camera_fit = None
+
+        return self.status()
+
+    def fit_camera_alignment(self):
+        with self._lock:
+            pairs = tuple(self._camera_pairs)
+
+        if len(pairs) < self.MIN_CAMERA_PAIRS:
+            raise ValueError(
+                f"Need at least {self.MIN_CAMERA_PAIRS} distinct "
+                "plate-solve/IMU pairs"
+            )
+
+        # Require genuinely different camera attitudes. Repeated solves
+        # without telescope movement are not calibration evidence.
+        matrices = [
+            np.asarray(item.camera_to_sky, dtype=float) for item in pairs
+        ]
+        distinct_motion = []
+        for i in range(len(matrices)):
+            for j in range(i + 1, len(matrices)):
+                relative = matrices[i].T @ matrices[j]
+                angle = math.degrees(math.acos(float(np.clip(
+                    (np.trace(relative) - 1.0) / 2.0, -1.0, 1.0
+                ))))
+                if angle >= 5.0:
+                    distinct_motion.append(angle)
+
+        if len(distinct_motion) < 3:
+            raise ValueError(
+                "Insufficient camera attitude coverage; move the telescope "
+                "to several substantially different altitude/azimuth positions"
+            )
+
+        matrix, rms, errors = camera_from_telescope_from_pairs(
+            [item.quaternion for item in pairs],
+            [item.camera_to_sky for item in pairs],
+            maximum_rms_deg=self.MAX_CAMERA_RMS_DEG,
+        )
+
+        result = {
+            "matrix": matrix.tolist(),
+            "rms_deg": float(rms),
+            "residuals_deg": [float(v) for v in errors],
+            "pair_count": len(pairs),
+            "frame_ids": [item.frame_id for item in pairs],
+            "distinct_motion_count": len(distinct_motion),
+        }
+        with self._lock:
+            self._camera_fit = result
+        return result
+
+    def measured_result(self):
+        with self._lock:
+            if self._sensor_fit is None or self._camera_fit is None:
+                raise ValueError(
+                    "Both sensor and camera alignment fits must pass "
+                    "before finalization"
+                )
+            if not self._camera_pairs or any(
+                item.timestamp_quality != "callback" or not item.clock_sync_verified
+                for item in self._camera_pairs
+            ):
+                raise ValueError(
+                    "Camera timing evidence is incomplete; capture all calibration "
+                    "pairs from the synchronized DirectShow v2 camera stream"
+                )
+
+            return {
+                "sensor_to_telescope": self._sensor_fit["matrix"],
+                "camera_from_telescope": self._camera_fit["matrix"],
+                "sensor_evidence": self._sensor_fit,
+                "camera_evidence": self._camera_fit,
+                "camera_timing_evidence": {
+                    "pair_count": len(self._camera_pairs),
+                    "frame_ids": [item.frame_id for item in self._camera_pairs],
+                    "timestamp_source": "directshow_sample_callback_qpc",
+                    "clock_sync_verified": True,
+                    "timing_uncertainty_s": None,
+                    "exposure_midpoint_verified": False,
+                },
+                "calibration_method": "physical_sweeps_and_paired_plate_solves_v2",
+                "created_at_unix": time.time(),
+            }
+
+    def reset(self):
+        with self._lock:
+            if self._active_sweep is not None:
+                raise RuntimeError("Finish or cancel the active sweep first")
+            self._sweeps.clear()
+            self._camera_pairs.clear()
+            self._sensor_fit = None
+            self._camera_fit = None
+
+
+
+
+====================================================================================================
+FILE: python\evf\webserver\server.py  [keyword score=3]
+====================================================================================================
+# Copyright (C) 2026 Arun Venkataswamy
+#
+# This file is part of PushNav.
+#
+# PushNav is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# PushNav is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with PushNav. If not, see <https://www.gnu.org/licenses/>.
+
+"""Mobile web interface — aiohttp HTTP + WebSocket server.
+
+Serves the React build under web_dist_dir() and pushes JSON state at ~10 Hz
+over WebSocket. Runs in a dedicated daemon thread with its own asyncio event
+loop.
+"""
+
+import asyncio
+import json
+import logging
+import math
+import threading
+import time
+from typing import Callable, Protocol
+
+from aiohttp import WSCloseCode, web
+
+from evf.config.manager import ConfigManager
+from evf.engine.frame_buffer import LatestFrame
+from evf.engine.goto_target import GotoTarget
+from evf.engine.navigation import compute_navigation, edge_arrow_position
+from evf.engine.pointing import PointingState
+from evf.engine.state import StateMachine
+from evf.network import local_ip
+from evf.paths import sounds_dir, version_json, web_dist_dir
+
+logger = logging.getLogger(__name__)
+
+
+_MAX_WS_CLIENTS = 10  # cap concurrent WebSocket connections
+_MAX_MJPEG_CLIENTS = 4
+_MJPEG_BOUNDARY = b"frame"
+_MJPEG_INTERVAL = 0.1  # 10 Hz
+
+# Camera image geometry — must match the React UI's overlay assumptions.
+_FOV_H = 8.86   # horizontal FOV in degrees
+_IMG_W = 1280
+_IMG_H = 720
+
+
+class EngineActions(Protocol):
+    """Action surface the WebServer calls into. Implemented by Engine."""
+
+    def step_advance(self) -> None: ...
+    def sync_retry(self) -> None: ...
+    def set_sync_selected(self, idx: int) -> None: ...
+    def use_previous_calibration(self) -> None: ...
+    def calibrate_imu_stationary(self) -> None: ...
+    def imu_alignment_workflow_status(self) -> dict: ...
+    def imu_alignment_start_sweep(self, axis: str, direction: int) -> dict: ...
+    def imu_alignment_finish_sweep(self) -> dict: ...
+    def imu_alignment_fit_sensor(self) -> dict: ...
+    def imu_alignment_camera_capture(self, active: bool) -> dict: ...
+    def imu_alignment_fit_camera(self) -> dict: ...
+    def imu_alignment_reset(self) -> dict: ...
+    def finalize_imu_alignment(self) -> dict: ...
+    def save_imu_alignment(
+        self, sensor_to_telescope, camera_from_telescope,
+        confirm_physical_alignment: bool,
+    ) -> None: ...
+    def retry_camera(self) -> bool: ...
+    def set_control(self, name: str, value: int) -> None: ...
+    def clear_goto_target(self) -> None: ...
+    def set_goto_target(self, ra_deg: float, dec_deg: float) -> None: ...
+    def set_audio_enabled(self, enabled: bool) -> None: ...
+    def inject_sample(self, name: str | None) -> None: ...
+    def inject_target(self, ra_deg: float, dec_deg: float) -> None: ...
+    def capture_frame(self): ...  # returns Path | None
+    def set_min_matches(self, value: int) -> None: ...
+    def set_max_prob(self, value: float) -> None: ...
+    def set_location(
+        self, latitude: float | None, longitude: float | None,
+    ) -> None: ...
+
+
+def _compute_origin(config: ConfigManager) -> tuple[float, float]:
+    """Pixel position of the sync offset (pointing center) in image coords.
+
+    Falls back to image center when no sync calibration is available.
+    """
+    cx, cy = _IMG_W / 2.0, _IMG_H / 2.0
+    d_body = config.sync_d_body
+    if d_body is not None and d_body[2] > 0.1:
+        scale = _IMG_W / (2.0 * math.tan(math.radians(_FOV_H / 2.0)))
+        cx += (-d_body[0] / d_body[2]) * scale
+        cy += (-d_body[1] / d_body[2]) * scale
+    return cx, cy
+
+
+@web.middleware
+async def _security_headers_middleware(request: web.Request, handler) -> web.StreamResponse:
+    """Add basic security headers to every HTTP response."""
+    response = await handler(request)
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        # 'self' is required for the React build's external <script> and
+        # <link rel="stylesheet"> tags pointing at /static/*; without it
+        # the browser silently drops them and renders a blank page.
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:",
+    )
+    return response
+
+
+def _is_local_origin(origin: str) -> bool:
+    """Return True if the WebSocket Origin header looks like a local address."""
+    import urllib.parse
+    try:
+        host = urllib.parse.urlparse(origin).hostname or ""
+        return (
+            host == "localhost"
+            or host.startswith("127.")
+            or host.startswith("192.168.")
+            or host.startswith("10.")
+            or host.startswith("172.")
+        )
+    except Exception:
+        return False
+
+
+class WebServer:
+    """HTTP + WebSocket server for the mobile web interface.
+
+    Always-on subsystem: started with the engine, stopped on shutdown.
+    HTTP GET /          — serves the React build (web_dist_dir / index.html)
+    HTTP GET /static/*  — React build assets (when web_dist_dir() exists)
+    HTTP GET /sounds/*  — serves WAV audio files
+    HTTP GET /frame.mjpg — multipart MJPEG of the latest camera frame
+    WebSocket /ws       — pushes JSON state at ~10 Hz to all clients
+    HTTP POST /api/*    — wizard, controls, settings, dev actions
+    """
+
+    def __init__(
+        self,
+        pointing: PointingState,
+        state_machine: StateMachine,
+        goto_target: GotoTarget,
+        config: ConfigManager,
+        *,
+        frame_buffer: LatestFrame | None = None,
+        solver_failures: Callable[[], int] | None = None,
+        stellarium_object: Callable[[], dict | None] | None = None,
+        camera_controls: Callable[[], list[dict] | None] | None = None,
+        sync_state: Callable[[], dict] | None = None,
+        activity: Callable[[], dict] | None = None,
+        stellarium_location: Callable[[], dict | None] | None = None,
+        location: Callable[[], dict] | None = None,
+        dev_mode: bool = False,
+        sample_active: Callable[[], str | None] | None = None,
+        actions: "EngineActions | None" = None,
+        on_client_connected: Callable[[], None] | None = None,
+        imu_attitude: Callable[[], object | None] | None = None,
+        imu_snapshot: Callable[[], object | None] | None = None,
+    ) -> None:
+        self._pointing = pointing
+        self._state_machine = state_machine
+        self._goto_target = goto_target
+        self._config = config
+        self._frame_buffer = frame_buffer
+        self._solver_failures = solver_failures
+        self._stellarium_object = stellarium_object
+        self._camera_controls = camera_controls
+        self._sync_state = sync_state
+        self._activity = activity
+        self._stellarium_location = stellarium_location
+        self._location_fn = location
+        self._dev_mode = dev_mode
+        self._sample_active = sample_active
+        self._actions = actions
+        self._on_client_connected = on_client_connected
+        self._imu_attitude = imu_attitude
+        self._imu_snapshot = imu_snapshot
+
+        self._clients: set[web.WebSocketResponse] = set()
+        self._mjpeg_clients: int = 0
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._serve_task: asyncio.Task | None = None
+        self._thread: threading.Thread | None = None
+        self._port: int | None = None  # actual bound port (for tests on ephemeral port)
+
+    # -- lifecycle ------------------------------------------------------------
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run, name="webserver", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self, timeout: float = 2.0) -> None:
+        # Cancel the serve task (not loop.stop()) so _serve's finally block
+        # can close websockets and release the port before the loop exits.
+        if self._loop is not None and self._serve_task is not None:
+            try:
+                self._loop.call_soon_threadsafe(self._serve_task.cancel)
+            except RuntimeError:
+                pass  # loop already closed
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+        logger.info("Web server stopped")
+
+    @property
+    def url(self) -> str | None:
+        """LAN URL of the mobile interface, or None without a LAN address.
+
+        Looked up on every call rather than once at start, so it follows the
+        network: a Pi's hotspot or Wi-Fi may come up after PushNav does.
+        """
+        ip = local_ip()
+        return f"http://{ip}:{self._config.web_port}" if ip else None
+
+    # -- internal -------------------------------------------------------------
+
+    def _run(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._serve_task = self._loop.create_task(self._serve())
+        try:
+            self._loop.run_until_complete(self._serve_task)
+        except asyncio.CancelledError:
+            pass  # normal stop()
+        except Exception as exc:
+            logger.error("Web server error: %s", exc)
+        finally:
+            # Request handlers still streaming (MJPEG) can outlive
+            # runner.cleanup(); cancel and drain them before closing.
+            pending = asyncio.all_tasks(self._loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                self._loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+            self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+            self._loop.close()
+
+    async def _serve(self) -> None:
+        port = self._config.web_port
+        url = self.url
+        if url is None:
+            logger.warning(
+                "Mobile web interface listening on port %d but no LAN IP "
+                "detected — mobile devices cannot reach the server",
+                port,
+            )
+        else:
+            logger.info("Mobile web interface at %s", url)
+
+        app = web.Application(middlewares=[_security_headers_middleware])
+        app.router.add_get("/", self._handle_index)
+        app.router.add_get("/api/version", self._handle_version)
+        app.router.add_get("/ws", self._handle_ws)
+        app.router.add_get("/frame.mjpg", self._handle_mjpeg)
+        app.router.add_post("/api/wizard/advance", self._api_wizard_advance)
+        app.router.add_post("/api/sync/retry", self._api_sync_retry)
+        app.router.add_post("/api/sync/select", self._api_sync_select)
+        app.router.add_post("/api/calibration/use-previous", self._api_use_previous_calibration)
+        app.router.add_post("/api/imu/calibrate-stationary", self._api_imu_calibrate_stationary)
+        app.router.add_get("/api/imu/alignment-workflow", self._api_imu_alignment_workflow_status)
+        app.router.add_post("/api/imu/alignment-workflow/sweep/start", self._api_imu_alignment_sweep_start)
+        app.router.add_post("/api/imu/alignment-workflow/sweep/finish", self._api_imu_alignment_sweep_finish)
+        app.router.add_post("/api/imu/alignment-workflow/sensor/fit", self._api_imu_alignment_sensor_fit)
+        app.router.add_post("/api/imu/alignment-workflow/camera/capture", self._api_imu_alignment_camera_capture)
+        app.router.add_post("/api/imu/alignment-workflow/camera/fit", self._api_imu_alignment_camera_fit)
+        app.router.add_post("/api/imu/alignment-workflow/finalize", self._api_imu_alignment_finalize)
+        app.router.add_post("/api/imu/alignment-workflow/reset", self._api_imu_alignment_reset)
+        app.router.add_post("/api/imu/alignment", self._api_imu_save_alignment)
+        app.router.add_post("/api/camera/retry", self._api_camera_retry)
+        app.router.add_post("/api/control", self._api_set_control)
+        app.router.add_post("/api/goto/clear", self._api_goto_clear)
+        app.router.add_post("/api/goto/set", self._api_goto_set)
+        app.router.add_post("/api/settings", self._api_settings)
+        app.router.add_post("/api/dev/inject-sample", self._api_dev_inject_sample)
+        app.router.add_post("/api/dev/inject-target", self._api_dev_inject_target)
+        app.router.add_post("/api/dev/capture-frame", self._api_dev_capture_frame)
+        app.router.add_static("/sounds", sounds_dir(), name="sounds")
+        dist = web_dist_dir()
+        if dist.exists():
+            app.router.add_static("/static", dist, name="react_static")
+
+        # Short shutdown_timeout: /frame.mjpg streams never finish on their
+        # own, and aiohttp would otherwise wait 60 s for them in cleanup().
+        runner = web.AppRunner(app, shutdown_timeout=0.5)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        # Capture the actually-bound port only when caller asked for ephemeral.
+        # Reaches into aiohttp internals, so we restrict to the test path.
+        if port == 0:
+            try:
+                self._port = site._server.sockets[0].getsockname()[1]
+            except Exception:
+                self._port = port
+        else:
+            self._port = port
+        logger.info("Web server listening on port %d", self._port)
+
+        try:
+            await self._broadcast_loop()
+        finally:
+            for ws in list(self._clients):
+                await ws.close(code=WSCloseCode.GOING_AWAY, message=b"server shutdown")
+            self._clients.clear()
+            await runner.cleanup()
+
+    async def _handle_index(self, request: web.Request) -> web.StreamResponse:
+        """Serve the React app shell from web_dist_dir().
+
+        Returns 503 when the React build is missing (dev mode without
+        ``npm run build``); the dev workflow uses Vite on port 5173 instead.
+        """
+        dist = web_dist_dir()
+        index = dist / "index.html"
+        if index.exists():
+            # Force revalidation on every load so a stale index.html in
+            # WKWebView's persistent NetworkCache can't pin the page to an
+            # obsolete content-hashed JS bundle. The bundle URLs themselves
+            # are content-addressed so they're safe to cache.
+            return web.FileResponse(
+                index, headers={"Cache-Control": "no-cache, must-revalidate"},
+            )
+        return web.Response(
+            status=503,
+            text=(
+                "React build not found at "
+                f"{dist}. Run 'npm run build' in web/ or use "
+                "'npm run dev' (Vite on :5173) for dev."
+            ),
+        )
+
+    async def _handle_version(self, request: web.Request) -> web.Response:
+        """Identify-as-PushNav endpoint.
+
+        Used by the single-instance check in main.py: a second launch
+        probes this URL and exits cleanly if the response carries our
+        ``app == "pushnav"`` marker. Independently useful for clients
+        and scripts that want app/protocol version info.
+        """
+        try:
+            with open(version_json()) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        return web.json_response({
+            "app": "pushnav",
+            "version": data.get("app_version"),
+            "protocol_version": data.get("protocol_version"),
+        })
+
+    # -- MJPEG frame stream ---------------------------------------------------
+
+    async def _handle_mjpeg(self, request: web.Request) -> web.StreamResponse:
+        """Multipart MJPEG stream of the latest camera frame.
+
+        Browsers and OS webviews render multipart/x-mixed-replace natively in
+        an <img> tag, so the React UI does not need any JS-side JPEG decoding.
+        """
+        if self._frame_buffer is None:
+            return web.Response(status=503, text="No frame buffer")
+        if self._mjpeg_clients >= _MAX_MJPEG_CLIENTS:
+            logger.warning("MJPEG client limit reached (%d), rejecting", _MAX_MJPEG_CLIENTS)
+            raise web.HTTPServiceUnavailable(reason="Too many MJPEG clients")
+        self._mjpeg_clients += 1
+        try:
+            resp = web.StreamResponse(
+                status=200,
+                headers={
+                    "Content-Type": (
+                        "multipart/x-mixed-replace; "
+                        f"boundary={_MJPEG_BOUNDARY.decode()}"
+                    ),
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                },
+            )
+            await resp.prepare(request)
+            last_frame_id = -1
+            try:
+                while True:
+                    jpeg, _ts, fid = self._frame_buffer.get()
+                    if jpeg is not None and fid != last_frame_id:
+                        last_frame_id = fid
+                        part = (
+                            b"--" + _MJPEG_BOUNDARY + b"\r\n"
+                            b"Content-Type: image/jpeg\r\n"
+                            b"Content-Length: " + str(len(jpeg)).encode() + b"\r\n\r\n"
+                            + jpeg + b"\r\n"
+                        )
+                        await resp.write(part)
+                    await asyncio.sleep(_MJPEG_INTERVAL)
+            except (asyncio.CancelledError, ConnectionResetError):
+                pass
+        finally:
+            self._mjpeg_clients -= 1
+        return resp
+
+    async def _handle_ws(self, request: web.Request) -> web.WebSocketResponse:
+        # Reject if connection cap reached
+        if len(self._clients) >= _MAX_WS_CLIENTS:
+            logger.warning("WebSocket connection limit reached (%d), rejecting", _MAX_WS_CLIENTS)
+            raise web.HTTPServiceUnavailable(reason="Too many clients")
+
+        # Warn on non-local origin (informational — LAN clients have no Origin header)
+        origin = request.headers.get("Origin", "")
+        if origin and not _is_local_origin(origin):
+            logger.warning("WebSocket connection from non-local origin: %s", origin)
+
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        self._clients.add(ws)
+        logger.info("Web client connected")
+        if self._on_client_connected is not None:
+            try:
+                self._on_client_connected()
+            except Exception as exc:
+                logger.debug("on_client_connected failed: %s", exc)
+        try:
+            async for _msg in ws:
+                pass  # read-only; ignore any incoming messages
+        finally:
+            self._clients.discard(ws)
+            logger.info("Web client disconnected")
+        return ws
+
+    async def _broadcast_loop(self) -> None:
+        while True:
+            await asyncio.sleep(0.1)  # 10 Hz
+            if not self._clients:
+                continue
+            try:
+                payload = json.dumps(self._build_payload())
+            except Exception as exc:
+                logger.debug("Payload build error: %s", exc)
+                continue
+            dead: set[web.WebSocketResponse] = set()
+            for ws in list(self._clients):
+                try:
+                    await ws.send_str(payload)
+                except Exception:
+                    dead.add(ws)
+            self._clients -= dead
+
+    # -- API actions ----------------------------------------------------------
+
+    async def _handle_api(self, request: web.Request, fn) -> web.Response:
+        """Run a synchronous engine action and return 204."""
+        if self._actions is None:
+            return web.Response(status=503, text="No actions wired")
+        try:
+            await asyncio.to_thread(fn)
+        except Exception as exc:
+            logger.exception("API action failed: %s", exc)
+            return web.Response(status=500, text=str(exc))
+        return web.Response(status=204)
+
+    async def _api_wizard_advance(self, request):
+        return await self._handle_api(request, lambda: self._actions.step_advance())
+
+    async def _api_sync_retry(self, request):
+        return await self._handle_api(request, lambda: self._actions.sync_retry())
+
+    async def _api_sync_select(self, request):
+        body = await request.json()
+        idx = int(body["idx"])
+        return await self._handle_api(request, lambda: self._actions.set_sync_selected(idx))
+
+    async def _api_use_previous_calibration(self, request):
+        return await self._handle_api(request, lambda: self._actions.use_previous_calibration())
+
+    async def _api_imu_calibrate_stationary(self, request: web.Request):
+        """Calibrate gyro bias from stationary IMU samples."""
+        return await self._handle_api(
+            request,
+            lambda: self._actions.calibrate_imu_stationary(),
+        )
+
+    async def _api_imu_alignment_workflow_status(self, request: web.Request) -> web.Response:
+        if self._actions is None:
+            return web.Response(status=503, text="No actions wired")
+        try:
+            return web.json_response(await asyncio.to_thread(
+                self._actions.imu_alignment_workflow_status
+            ))
+        except Exception as exc:
+            return web.Response(status=500, text=str(exc))
+
+    async def _api_imu_alignment_sweep_start(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            axis = str(body["axis"])
+            direction = int(body["direction"])
+            if axis not in ("altitude", "azimuth") or direction not in (-1, 1):
+                raise ValueError("axis must be altitude/azimuth and direction must be -1/+1")
+        except (ValueError, TypeError, KeyError) as exc:
+            return web.Response(status=400, text=str(exc))
+        return await self._handle_api(request, lambda: self._actions.imu_alignment_start_sweep(axis, direction))
+
+    async def _api_imu_alignment_sweep_finish(self, request: web.Request) -> web.Response:
+        return await self._handle_api(request, self._actions.imu_alignment_finish_sweep)
+
+    async def _api_imu_alignment_sensor_fit(self, request: web.Request) -> web.Response:
+        return await self._handle_api(request, self._actions.imu_alignment_fit_sensor)
+
+    async def _api_imu_alignment_camera_capture(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            active = body["active"]
+            if not isinstance(active, bool):
+                raise ValueError("active must be boolean")
+        except (ValueError, TypeError, KeyError) as exc:
+            return web.Response(status=400, text=str(exc))
+        return await self._handle_api(request, lambda: self._actions.imu_alignment_camera_capture(active))
+
+    async def _api_imu_alignment_camera_fit(self, request: web.Request) -> web.Response:
+        return await self._handle_api(request, self._actions.imu_alignment_fit_camera)
+
+    async def _api_imu_alignment_finalize(self, request: web.Request) -> web.Response:
+        return await self._handle_api(request, self._actions.finalize_imu_alignment)
+
+    async def _api_imu_alignment_reset(self, request: web.Request) -> web.Response:
+        return await self._handle_api(request, self._actions.imu_alignment_reset)
+
+    async def _api_imu_save_alignment(self, request: web.Request) -> web.Response:
+        """Legacy arbitrary-matrix endpoint is intentionally disabled."""
+        return web.Response(
+            status=410,
+            text="Manual alignment is disabled. Use /api/imu/alignment-workflow.",
+        )
+
+    async def _api_camera_retry(self, request: web.Request) -> web.Response:
+        """Re-attempt camera startup. Returns 200 + {connected: bool}."""
+        if self._actions is None:
+            return web.Response(status=503, text="No actions wired")
+        try:
+            connected = await asyncio.to_thread(self._actions.retry_camera)
+        except Exception as exc:
+            logger.exception("retry_camera failed: %s", exc)
+            return web.Response(status=500, text=str(exc))
+        return web.json_response({"connected": bool(connected)})
+
+    async def _api_set_control(self, request):
+        body = await request.json()
+        name = str(body["name"])
+        value = int(body["value"])
+        return await self._handle_api(request, lambda: self._actions.set_control(name, value))
+
+    async def _api_goto_clear(self, request):
+        return await self._handle_api(request, lambda: self._actions.clear_goto_target())
+
+    async def _api_goto_set(self, request: web.Request) -> web.Response:
+        body = await request.json()
+        ra = float(body["ra_deg"])
+        dec = float(body["dec_deg"])
+        return await self._handle_api(
+            request, lambda: self._actions.set_goto_target(ra, dec)
+        )
+
+    async def _api_settings(self, request):
+        body = await request.json()
+        if "audio_enabled" in body:
+            resp = await self._handle_api(
+                request,
+                lambda: self._actions.set_audio_enabled(bool(body["audio_enabled"])),
+            )
+            if resp.status >= 400:
+                return resp
+        if "min_matches" in body:
+            resp = await self._handle_api(
+                request,
+                lambda: self._actions.set_min_matches(int(body["min_matches"])),
+            )
+            if resp.status >= 400:
+                return resp
+        if "max_prob" in body:
+            resp = await self._handle_api(
+                request,
+                lambda: self._actions.set_max_prob(float(body["max_prob"])),
+            )
+            if resp.status >= 400:
+                return resp
+        if "location" in body:
+            loc = body["location"]
+            if loc is None:
+                resp = await self._handle_api(
+                    request, lambda: self._actions.set_location(None, None),
+                )
+            else:
+                lat = float(loc["latitude"])
+                lon = float(loc["longitude"])
+                resp = await self._handle_api(
+                    request, lambda: self._actions.set_location(lat, lon),
+                )
+            if resp.status >= 400:
+                return resp
+        if "lx200_epoch" in body:
+            resp = await self._handle_api(
+                request,
+                lambda: self._actions.set_lx200_epoch(str(body["lx200_epoch"])),
+            )
+            if resp.status >= 400:
+                return resp
+        return web.Response(status=204)
+
+    async def _api_dev_inject_sample(self, request):
+        body = await request.json()
+        name = body.get("name")  # str or None
+        return await self._handle_api(
+            request, lambda: self._actions.inject_sample(name),
+        )
+
+    async def _api_dev_inject_target(self, request):
+        body = await request.json()
+        ra = float(body["ra_deg"])
+        dec = float(body["dec_deg"])
+        return await self._handle_api(
+            request, lambda: self._actions.inject_target(ra, dec),
+        )
+
+    async def _api_dev_capture_frame(self, request):
+        """Save the latest frame to ~/Downloads. Returns 200 + JSON {path}."""
+        if self._actions is None:
+            return web.Response(status=503, text="No actions wired")
+        try:
+            path = await asyncio.to_thread(self._actions.capture_frame)
+        except Exception as exc:
+            logger.exception("capture_frame failed: %s", exc)
+            return web.Response(status=500, text=str(exc))
+        if path is None:
+            return web.json_response({"path": None, "error": "no frame"}, status=409)
+        return web.json_response({"path": str(path)})
+
+    # -- payload --------------------------------------------------------------
+
+    def _build_payload(self) -> dict:
+        state = self._state_machine.state
+        snap = self._pointing.read()
+        target = self._goto_target.read()
+        failures = self._solver_failures() if self._solver_failures else 0
+        origin_x, origin_y = _compute_origin(self._config)
+        dx_off = origin_x - _IMG_W / 2.0
+        dy_off = origin_y - _IMG_H / 2.0
+
+        pointing_data = {
+            "valid": snap.valid,
+            "ra_deg": snap.ra_j2000,
+            "dec_deg": snap.dec_j2000,
+            "roll_deg": snap.roll,
+            "matches": snap.matches,
+            "prob": snap.prob,
+            "solve_age_s": (
+                round(time.monotonic() - snap.last_success_timestamp, 1)
+                if snap.valid else None
+            ),
+        }
+
+        imu_snapshot = self._imu_snapshot() if self._imu_snapshot else None
+        attitude = (
+            imu_snapshot.attitude
+            if imu_snapshot is not None
+            else (self._imu_attitude() if self._imu_attitude else None)
+        )
+        imu_data = None
+        if attitude is not None:
+            imu_data = {
+                "available": True,
+                "altitude_relative_deg": attitude.altitude_relative_deg,
+                "azimuth_relative_deg": attitude.azimuth_relative_deg,
+                "roll_deg": attitude.roll_deg,
+                "pitch_deg": attitude.pitch_deg,
+                "yaw_relative_deg": attitude.yaw_relative_deg,
+                "yaw_drift_warning": attitude.yaw_drift_warning,
+                "sample_age_s": attitude.sample_age_s,
+                "accel_correction_used": attitude.accel_correction_used,
+                "reference_initialized": attitude.reference_initialized,
+                "raw_accel_g": (
+                    list(imu_snapshot.raw_sample.accel_g)
+                    if imu_snapshot is not None else None
+                ),
+                "raw_gyro_dps": (
+                    list(imu_snapshot.raw_sample.gyro_dps)
+                    if imu_snapshot is not None else None
+                ),
+            }
+
+        nav_data = self._build_nav(snap, target, origin_x, origin_y, dx_off, dy_off)
+
+        controls = self._camera_controls() if self._camera_controls else []
+        sync_blk = self._sync_state() if self._sync_state else {
+            "in_progress": False, "candidates": [], "selected_idx": None, "error": None,
+        }
+        activity_blk = self._activity() if self._activity else {}
+        camera_blk = {
+            "connected": True if (self._frame_buffer and self._frame_buffer.get()[0]) else False,
+            "all_centroids": snap.all_centroids if snap.valid else None,
+            "matched_centroids": snap.matched_centroids if snap.valid else None,
+        }
+
+        stellarium_blk = dict(
+            activity_blk.get("stellarium", {"active": False, "address": None})
+        )
+        if self._stellarium_location is not None:
+            try:
+                stellarium_blk["location"] = self._stellarium_location()
+            except Exception:
+                stellarium_blk["location"] = None
+        else:
+            stellarium_blk.setdefault("location", None)
+
+        location_blk = self._location_fn() if self._location_fn else {
+            "latitude": None, "longitude": None, "source": None,
+        }
+
+        alignment_data = {
+            "sensor_mapping_status": "UNVERIFIED",
+            "camera_alignment_status": "UNVERIFIED",
+            "sensor_to_telescope": None,
+            "camera_from_telescope": None,
+            "celestial_propagation_enabled": False,
+        }
+
+        # Saved calibration values are useful for display, but saved VERIFIED
+        # flags alone must never imply that the live engine is calibrated.
+        try:
+            import json
+            alignment_path = self._config.path.parent / "imu" / "sensor_alignment.json"
+            with alignment_path.open("r", encoding="utf-8-sig") as handle:
+                saved_alignment = json.load(handle)
+            if isinstance(saved_alignment, dict):
+                alignment_data["sensor_to_telescope"] = (
+                    saved_alignment.get("sensor_to_telescope")
+                )
+                alignment_data["camera_from_telescope"] = (
+                    saved_alignment.get("camera_from_telescope")
+                )
+        except (OSError, ValueError, TypeError):
+            pass
+
+        # The engine provider is authoritative for live verification.
+        status_provider = getattr(self._actions, "imu_alignment_status", None)
+        if callable(status_provider):
+            try:
+                runtime_status = status_provider()
+                if isinstance(runtime_status, dict):
+                    alignment_data.update(runtime_status)
+            except Exception:
+                logger.exception("Unable to read live IMU alignment status")
+
+        return {
+            "state": state.value,
+            "failures": failures,
+            "pointing": pointing_data,
+            "imu": imu_data,
+            "imu_alignment": alignment_data,
+            "nav": nav_data,
+            "origin_x": origin_x,
+            "origin_y": origin_y,
+            "image_w": _IMG_W,
+            "image_h": _IMG_H,
+            "finder_rotation": self._config.finder_rotation,
+            "fov_h_deg": _FOV_H,
+            "has_calibration": self._config.has_calibration,
+            "image_size": list(snap.image_size) if snap.valid and snap.image_size else None,
+            "controls": controls or [],
+            "sync": sync_blk,
+            "stellarium": stellarium_blk,
+            "lx200":      activity_blk.get("lx200",      {"active": False, "address": None}),
+            "webserver":  activity_blk.get("webserver",  {"url": None}),
+            "audio_enabled": activity_blk.get("audio_enabled", True),
+            "camera": camera_blk,
+            "location": location_blk,
+            "dev_mode": self._dev_mode,
+            "min_matches": self._config.min_matches,
+            "max_prob": self._config.max_prob,
+            "sample_active": (
+                self._sample_active() if self._sample_active else None
+            ),
+        }
+
+    def _build_nav(self, snap, target, origin_x, origin_y, dx_off, dy_off) -> dict | None:
+        if not target.active:
+            return None
+
+        obj_name = None
+        if self._stellarium_object:
+            obj = self._stellarium_object()
+            if obj:
+                obj_name = obj.get("localized-name") or obj.get("name")
+
+        base = {
+            "active": True,
+            "target_name": obj_name,
+            "target_ra_deg": target.ra_j2000,
+            "target_dec_deg": target.dec_j2000,
+        }
+
+        if not snap.valid:
+            return {**base, "separation_deg": None, "direction_text": "--",
+                    "in_fov": False, "pixel_x": None, "pixel_y": None,
+                    "camera_angle_deg": None, "edge_x": None, "edge_y": None,
+                    "edge_angle_deg": None}
+
+        nav = compute_navigation(
+            snap.ra_j2000, snap.dec_j2000, snap.roll,
+            target.ra_j2000, target.dec_j2000,
+            _FOV_H, _IMG_W, _IMG_H,
+        )
+
+        # Apply sync offset to in-FOV pixel coords so the React side renders the
+        # target marker at its actual position in the camera image. compute_navigation
+        # returns coords assuming "image center == pointing center", but the
+        # eyepiece's projected center is offset by (dx_off, dy_off) from the
+        # camera image center.
+        offset_pixel_x = nav.pixel_x + dx_off if nav.pixel_x is not None else None
+        offset_pixel_y = nav.pixel_y + dy_off if nav.pixel_y is not None else None
+
+        # in_fov must use the offset position — that's where the marker actually
+        # lands on the displayed frame. nav.in_fov is computed pre-offset, so
+        # it disagrees with the rendered position whenever sync has a non-zero
+        # offset (target visually in-frame but flagged as outside, or vice versa).
+        in_fov = (
+            offset_pixel_x is not None
+            and offset_pixel_y is not None
+            and 0 <= offset_pixel_x < _IMG_W
+            and 0 <= offset_pixel_y < _IMG_H
+        )
+
+        edge_x = edge_y = edge_angle = None
+        if not in_fov:
+            if offset_pixel_x is not None:
+                edge_x, edge_y, edge_angle = edge_arrow_position(
+                    offset_pixel_x, offset_pixel_y,
+                    _IMG_W, _IMG_H, margin=68,
+                    origin_x=origin_x, origin_y=origin_y,
+                )
+            else:
+                # Target behind camera — derive direction from camera_angle_deg
+                far = max(_IMG_W, _IMG_H) * 10.0
+                rad = math.radians(nav.camera_angle_deg)
+                far_x = origin_x + far * math.sin(rad)
+                far_y = origin_y - far * math.cos(rad)
+                edge_x, edge_y, edge_angle = edge_arrow_position(
+                    far_x, far_y, _IMG_W, _IMG_H, margin=68,
+                    origin_x=origin_x, origin_y=origin_y,
+                )
+
+        return {
+            **base,
+            "separation_deg": nav.separation_deg,
+            "direction_text": nav.direction_text,
+            "in_fov": in_fov,
+            "pixel_x": offset_pixel_x,
+            "pixel_y": offset_pixel_y,
+            "camera_angle_deg": nav.camera_angle_deg,
+            "edge_x": edge_x,
+            "edge_y": edge_y,
+            "edge_angle_deg": edge_angle,
+        }
+
+====================================================================================================
+FILE: python\evf\engine\pointing.py  [keyword score=1]
+====================================================================================================
+# Copyright (C) 2026 Arun Venkataswamy
+#
+# This file is part of PushNav.
+#
+# PushNav is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# PushNav is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with PushNav. If not, see <https://www.gnu.org/licenses/>.
+
+"""Thread-safe container for the last valid plate-solve result."""
+
+import threading
+import time
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class PointingSnapshot:
+    """Immutable snapshot of pointing state, safe to pass between threads."""
+
+    ra_j2000: float
+    dec_j2000: float
+    roll: float
+    matches: int
+    prob: float
+    last_success_timestamp: float
+    valid: bool
+    all_centroids: list | None = None       # List of [y, x] for all detected stars
+    matched_centroids: list | None = None   # List of [y, x] for matched stars
+    image_size: tuple[int, int] | None = None  # (height, width)
+
+
+class PointingState:
+    """Thread-safe pointing state. Updated only by the solver thread."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._ra_j2000: float = 0.0
+        self._dec_j2000: float = 0.0
+        self._roll: float = 0.0
+        self._matches: int = 0
+        self._prob: float = 0.0
+        self._last_success_timestamp: float = 0.0
+        self._valid: bool = False
+        self._all_centroids: list | None = None
+        self._matched_centroids: list | None = None
+        self._image_size: tuple[int, int] | None = None
+
+    def update(
+        self,
+        ra_j2000: float,
+        dec_j2000: float,
+        roll: float,
+        matches: int,
+        prob: float,
+        *,
+        all_centroids: list | None = None,
+        matched_centroids: list | None = None,
+        image_size: tuple[int, int] | None = None,
+    ) -> None:
+        """Update with a new valid solve result. Called only by solver thread."""
+        with self._lock:
+            self._ra_j2000 = ra_j2000
+            self._dec_j2000 = dec_j2000
+            self._roll = roll
+            self._matches = matches
+            self._prob = prob
+            self._last_success_timestamp = time.monotonic()
+            self._valid = True
+            self._all_centroids = all_centroids
+            self._matched_centroids = matched_centroids
+            self._image_size = image_size
+
+    def update_from_imu(
+        self,
+        ra_j2000: float,
+        dec_j2000: float,
+        expected_last_success_timestamp: float,
+    ) -> bool:
+        """Apply IMU-propagated coordinates without changing solve metadata.
+
+        The expected timestamp prevents an older IMU anchor from overwriting
+        a newer plate-solve result.
+        """
+        import math
+        if (
+            not math.isfinite(ra_j2000)
+            or not math.isfinite(dec_j2000)
+            or not -90.0 <= dec_j2000 <= 90.0
+        ):
+            return False
+
+        with self._lock:
+            if (
+                not self._valid
+                or self._last_success_timestamp != expected_last_success_timestamp
+            ):
+                return False
+            self._ra_j2000 = ra_j2000 % 360.0
+            self._dec_j2000 = dec_j2000
+            return True
+
+    def read(self) -> PointingSnapshot:
+        """Return an immutable snapshot. Called by UI and Stellarium threads."""
+        with self._lock:
+            return PointingSnapshot(
+                ra_j2000=self._ra_j2000,
+                dec_j2000=self._dec_j2000,
+                roll=self._roll,
+                matches=self._matches,
+                prob=self._prob,
+                last_success_timestamp=self._last_success_timestamp,
+                valid=self._valid,
+                all_centroids=self._all_centroids,
+                matched_centroids=self._matched_centroids,
+                image_size=self._image_size,
+            )
+
+    def clear_centroids(self) -> None:
+        """Clear centroid data (e.g. on solve failure)."""
+        with self._lock:
+            self._all_centroids = None
+            self._matched_centroids = None
+            self._image_size = None
+
+    def invalidate(self) -> None:
+        """Mark state as invalid (e.g. on camera disconnect)."""
+        with self._lock:
+            self._valid = False
+
+====================================================================================================
+FILE: python\evf\imu\alignment_calibration.py  [keyword score=1]
+====================================================================================================
+"""Measured IMU/telescope and camera/telescope rotational calibration."""
+
+from __future__ import annotations
+
+import math
+import numpy as np
+
+
+def _rotation(value, name="rotation"):
+    matrix = np.asarray(value, dtype=float)
+    if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
+        raise ValueError(f"{name} must be a finite 3x3 matrix")
+    if not np.allclose(matrix.T @ matrix, np.eye(3), atol=1e-3):
+        raise ValueError(f"{name} must be orthonormal")
+    if not np.isclose(np.linalg.det(matrix), 1.0, atol=1e-3):
+        raise ValueError(f"{name} must have determinant +1")
+    return matrix
+
+
+def _unit(vector):
+    vector = np.asarray(vector, dtype=float)
+    norm = float(np.linalg.norm(vector))
+    if not np.isfinite(norm) or norm < 1e-8:
+        raise ValueError("Rotation axis is degenerate")
+    return vector / norm
+
+
+def fit_rotation(source_vectors, target_vectors, minimum_angle_deg=10.0):
+    """Return proper rotation mapping source vectors onto target vectors.
+
+    Uses the Kabsch/Wahba solution. Rows in each input are corresponding
+    measured directions. Requires two nonparallel constraints.
+    """
+    source = np.asarray(source_vectors, dtype=float)
+    target = np.asarray(target_vectors, dtype=float)
+
+    if source.ndim != 2 or target.ndim != 2:
+        raise ValueError("Vector inputs must be 2D arrays")
+    if source.shape != target.shape or source.shape[1] != 3:
+        raise ValueError("Inputs must have matching Nx3 shape")
+    if source.shape[0] < 2 or not np.isfinite(source).all() \
+            or not np.isfinite(target).all():
+        raise ValueError("At least two finite vector pairs are required")
+
+    source = np.array([_unit(v) for v in source])
+    target = np.array([_unit(v) for v in target])
+
+    # Reject effectively collinear direction sets.
+    #
+    # Two nonparallel direction families are sufficient to determine a
+    # proper 3D rotation. Their centered point cloud is normally planar,
+    # so the *smallest* singular value is expected to be zero. Use the
+    # second-largest singular value to detect whether the directions span
+    # at least two independent axes.
+    source_spread = np.linalg.svd(
+        source, compute_uv=False
+    )
+    target_spread = np.linalg.svd(
+        target, compute_uv=False
+    )
+    threshold = math.sin(math.radians(minimum_angle_deg))
+    if (
+        source_spread.size < 2
+        or target_spread.size < 2
+        or source_spread[1] < threshold
+        or target_spread[1] < threshold
+    ):
+        raise ValueError("Calibration vectors lack angular diversity")
+
+    covariance = source.T @ target
+    u, _, vt = np.linalg.svd(covariance)
+    correction = np.eye(3)
+    correction[2, 2] = np.linalg.det(vt.T @ u.T)
+    result = vt.T @ correction @ u.T
+    _rotation(result, "fitted rotation")
+
+    predicted = (result @ source.T).T
+    # atan2(cross magnitude, dot) is well-conditioned near zero degrees.
+    # arccos(dot) loses precision when dot is extremely close to 1.
+    cross_magnitudes = np.linalg.norm(
+        np.cross(predicted, target), axis=1
+    )
+    dot_products = np.clip(
+        np.sum(predicted * target, axis=1), -1.0, 1.0
+    )
+    errors = np.degrees(
+        np.arctan2(cross_magnitudes, dot_products)
+    )
+    return result, float(np.sqrt(np.mean(errors ** 2))), errors.tolist()
+
+
+def sensor_to_telescope_from_sweep_axes(sensor_axes, telescope_axes):
+    """Fit sensor->telescope from signed, known physical rotation axes.
+
+    sensor_axes: gyro rotation axes in raw sensor coordinates.
+    telescope_axes: corresponding signed axes in telescope coordinates.
+    Telescope frame convention: x aperture-forward, y transverse,
+    z upward. Example known axis targets: altitude=(0,1,0),
+    azimuth=(0,0,1), provided the sweep directions were signed correctly.
+    """
+    matrix, rms, errors = fit_rotation(sensor_axes, telescope_axes)
+    if rms > 5.0:
+        raise ValueError(f"Sensor alignment residual too high: {rms:.2f} deg")
+    return matrix, rms, errors
+
+
+def _quaternion_matrix(q):
+    """Convert scalar-first unit quaternion to body->reference matrix."""
+    q = np.asarray(q, dtype=float)
+    if q.shape != (4,) or not np.isfinite(q).all():
+        raise ValueError("Quaternion must contain four finite values")
+    norm = float(np.linalg.norm(q))
+    if norm < 1e-8:
+        raise ValueError("Quaternion norm is zero")
+    w, x, y, z = q / norm
+    return np.array([
+        [1 - 2*(y*y + z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
+        [2*(x*y + z*w), 1 - 2*(x*x + z*z), 2*(y*z - x*w)],
+        [2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x + y*y)],
+    ])
+
+
+def _rotation_axis_angle(matrix):
+    """Return signed axis and angle in radians for a proper rotation."""
+    matrix = _rotation(matrix)
+    angle = math.acos(float(np.clip(
+        (np.trace(matrix) - 1.0) / 2.0, -1.0, 1.0
+    )))
+    if angle < math.radians(2.0):
+        return None, angle
+
+    axis = np.array([
+        matrix[2, 1] - matrix[1, 2],
+        matrix[0, 2] - matrix[2, 0],
+        matrix[1, 0] - matrix[0, 1],
+    ]) / (2.0 * math.sin(angle))
+    return _unit(axis), angle
+
+
+def camera_from_telescope_from_pairs(
+    imu_quaternions,
+    camera_to_sky_matrices,
+    minimum_pair_angle_deg=5.0,
+    maximum_rms_deg=3.0,
+):
+    """Estimate camera<-telescope from paired camera/IMU orientations.
+
+    Each IMU quaternion must represent telescope->IMU-reference, and each
+    camera matrix must represent camera->celestial, both at the same frame.
+    Relative rotations eliminate the unknown global reference rotation.
+
+    Returns (camera_from_telescope, rms_deg, residuals_deg).
+    """
+    if len(imu_quaternions) != len(camera_to_sky_matrices):
+        raise ValueError("IMU and plate-solve sample counts differ")
+    if len(imu_quaternions) < 3:
+        raise ValueError("At least three paired orientations are required")
+
+    imu = [_quaternion_matrix(q) for q in imu_quaternions]
+    camera = [_rotation(m, "camera_to_sky") for m in camera_to_sky_matrices]
+
+    source_axes = []
+    target_axes = []
+    min_angle = math.radians(minimum_pair_angle_deg)
+
+    # Every pair contributes a relative-rotation axis correspondence.
+    for i in range(len(imu)):
+        for j in range(i + 1, len(imu)):
+            imu_relative = imu[i].T @ imu[j]
+            camera_relative = camera[i].T @ camera[j]
+
+            imu_axis, imu_angle = _rotation_axis_angle(imu_relative)
+            camera_axis, camera_angle = _rotation_axis_angle(camera_relative)
+
+            if imu_axis is None or camera_axis is None:
+                continue
+            if min(imu_angle, camera_angle) < min_angle:
+                continue
+
+            # Axis mapping: camera_axis = A @ telescope_axis.
+            source_axes.append(imu_axis)
+            target_axes.append(camera_axis)
+
+    if len(source_axes) < 2:
+        raise ValueError(
+            "Insufficient rotational motion; capture varied altitude "
+            "and azimuth orientations"
+        )
+
+    matrix, rms, errors = fit_rotation(source_axes, target_axes)
+    if rms > maximum_rms_deg:
+        raise ValueError(
+            f"Camera alignment residual {rms:.2f} deg exceeds "
+            f"{maximum_rms_deg:.2f} deg"
+        )
+    return matrix, rms, errors
+
+
+
+
+====================================================================================================
+FILE: python\evf\imu\service.py  [keyword score=1]
+====================================================================================================
+"""Lifecycle wrapper for the optional telescope IMU."""
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass, replace
+import json
+import logging
+import os
+from pathlib import Path
+import tempfile
+import threading
+import time
+
+from evf.imu.calibration import Calibration, calibrate_stationary
+from evf.imu.estimator import Attitude, RelativeAttitudeEstimator
+from evf.imu.stream import ImuSerialStream
+from evf.imu.protocol import RawSample
+from evf.imu.interpolation import interpolate_quaternion
+from evf.imu.clock_sync import map_host_time_to_device_us
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ImuSnapshot:
+    """One synchronized IMU attitude, rotation, and sample timestamp."""
+
+    attitude: Attitude
+    quaternion: tuple[float, float, float, float]
+    device_time_us: int
+    received_at_monotonic: float
+    raw_sample: RawSample
+    continuity_id: int = 0
+
+
+class ImuService:
+    """Loads IMU configuration and owns the serial reader and estimator."""
+
+    def __init__(self, config_dir: Path, port: str = "COM3"):
+        self.config_dir = Path(config_dir)
+        self.port = port
+        self.stream: ImuSerialStream | None = None
+        self.estimator: RelativeAttitudeEstimator | None = None
+        # True only when sensor_to_telescope came from a verified alignment.
+        # A provisional identity mapping supports relative motion, never sky pointing.
+        self.sensor_mapping_verified = False
+
+        self._worker_thread: threading.Thread | None = None
+        self._worker_stop_event = threading.Event()
+        self._attitude_lock = threading.Lock()
+        # Serializes estimator.update()/quaternion reads against calibration.
+        self._estimator_lock = threading.Lock()
+        self._latest_attitude: Attitude | None = None
+        self._latest_snapshot: ImuSnapshot | None = None
+        self._orientation_history: deque[ImuSnapshot] = deque(maxlen=2000)
+        self._continuity_id = 0
+        self._max_contiguous_gap_us = 250_000
+
+    @property
+    def latest_attitude(self) -> Attitude | None:
+        """Return a safe copy of the most recently estimated attitude."""
+        with self._attitude_lock:
+            if self._latest_attitude is None:
+                return None
+            return replace(self._latest_attitude)
+
+    @property
+    def latest_snapshot(self) -> ImuSnapshot | None:
+        """Return a safe copy of the latest synchronized IMU snapshot."""
+        with self._attitude_lock:
+            snapshot = self._latest_snapshot
+            if snapshot is None:
+                return None
+            return replace(
+                snapshot,
+                attitude=replace(snapshot.attitude),
+            )
+
+    @property
+    def orientation_history(self) -> tuple[ImuSnapshot, ...]:
+        """Return a safe chronological copy of recent IMU orientations."""
+        with self._attitude_lock:
+            return tuple(
+                replace(item, attitude=replace(item.attitude))
+                for item in self._orientation_history
+            )
+
+    def interpolated_quaternion(
+        self, device_time_us: int, max_gap_us: int = 30000
+    ) -> tuple[float, float, float, float] | None:
+        """Return an interpolated orientation at an Arduino device timestamp."""
+        history = self.orientation_history
+        samples = (
+            (item.device_time_us, item.quaternion)
+            for item in history
+        )
+        return interpolate_quaternion(samples, device_time_us, max_gap_us)
+
+    def orientation_at_host_time(
+        self, host_monotonic: float, max_gap_us: int = 30000
+    ) -> tuple[int, tuple[float, float, float, float]] | None:
+        """Estimate orientation at a host time using approximate clock mapping."""
+        stream = self.stream
+        if stream is None:
+            return None
+
+        records = stream.history.snapshot()
+        device_time_us = map_host_time_to_device_us(records, host_monotonic)
+        if device_time_us is None:
+            return None
+
+        history = self.orientation_history
+        previous = None
+        reference_initialized = False
+
+        for item in history:
+            if item.device_time_us == device_time_us:
+                reference_initialized = item.attitude.reference_initialized
+                break
+
+            if (
+                previous is not None
+                and previous.device_time_us < device_time_us < item.device_time_us
+            ):
+                reference_initialized = (
+                    previous.attitude.reference_initialized
+                    and item.attitude.reference_initialized
+                )
+                break
+
+            previous = item
+
+        if not reference_initialized:
+            return None
+
+        samples = (
+            (item.device_time_us, item.quaternion)
+            for item in history
+        )
+        quaternion = interpolate_quaternion(
+            samples, device_time_us, max_gap_us
+        )
+        if quaternion is None:
+            return None
+
+        return device_time_us, quaternion
+
+    def set_sensor_to_telescope(self, matrix) -> None:
+        """Apply a physically verified sensor mapping without racing the worker."""
+        with self._estimator_lock:
+            if self.estimator is None:
+                raise RuntimeError("IMU estimator is not initialized")
+            self.estimator.set_sensor_to_telescope(matrix)
+            self.sensor_mapping_verified = True
+            self._continuity_id += 1
+            with self._attitude_lock:
+                self._latest_attitude = None
+                self._latest_snapshot = None
+                self._orientation_history.clear()
+
+    def start(self) -> bool:
+        calibration_path = self.config_dir / "imu_calibration.json"
+        alignment_path = self.config_dir / "sensor_alignment.json"
+
+        try:
+            with calibration_path.open("r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+
+            calibration = Calibration(
+                gyro_bias_dps=tuple(data["gyro_bias_dps"]),
+                accel_mean_g=tuple(data["accel_mean_g"]),
+                gyro_noise_dps=tuple(data["gyro_noise_dps"]),
+                sample_count=int(data["sample_count"]),
+            )
+
+            # The sensor mounting transform is a physical calibration, not
+            # something that can safely be inferred from software.  If it is
+            # unavailable, use identity solely to keep relative-motion
+            # telemetry alive and explicitly prohibit celestial propagation.
+            alignment = {}
+            try:
+                with alignment_path.open("r", encoding="utf-8-sig") as f:
+                    loaded_alignment = json.load(f)
+                if isinstance(loaded_alignment, dict):
+                    alignment = loaded_alignment
+                else:
+                    logger.warning(
+                        "IMU alignment file is not a JSON object; "
+                        "using provisional identity mapping."
+                    )
+            except FileNotFoundError:
+                logger.warning(
+                    "IMU alignment file %s is missing; using provisional "
+                    "identity mapping. Relative motion only.",
+                    alignment_path,
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning(
+                    "Could not read IMU alignment (%s); using provisional "
+                    "identity mapping. Relative motion only.",
+                    exc,
+                )
+
+            sensor_matrix = alignment.get("sensor_to_telescope")
+            mapping_verified = (
+                alignment.get("mapping_status") == "VERIFIED"
+                and sensor_matrix is not None
+            )
+
+            estimator_options = {
+                "accel_kp": alignment.get("accel_kp_per_second", 2.0),
+                "min_accel_g": alignment.get("min_accel_g", 0.85),
+                "max_accel_g": alignment.get("max_accel_g", 1.15),
+                "altitude_sign": alignment.get("altitude_sign", 1.0),
+                "azimuth_sign": alignment.get("azimuth_sign", 1.0),
+            }
+
+            try:
+                self.estimator = RelativeAttitudeEstimator(
+                    calibration,
+                    sensor_to_telescope=(
+                        sensor_matrix
+                        if sensor_matrix is not None
+                        else ((1, 0, 0), (0, 1, 0), (0, 0, 1))
+                    ),
+                    **estimator_options,
+                )
+            except (TypeError, ValueError) as exc:
+                # A malformed/unusable mounting matrix must not be silently
+                # treated as calibrated. Retry with an explicit provisional
+                # identity transform for relative telemetry only.
+                logger.warning(
+                    "Invalid IMU sensor-to-telescope transform (%s); "
+                    "using provisional identity mapping. Relative motion only.",
+                    exc,
+                )
+                self.estimator = RelativeAttitudeEstimator(
+                    calibration,
+                    sensor_to_telescope=((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+                    **estimator_options,
+                )
+                mapping_verified = False
+
+            self.sensor_mapping_verified = bool(mapping_verified)
+            if not self.sensor_mapping_verified:
+                logger.warning(
+                    "IMU sensor-to-telescope mapping is NOT VERIFIED; "
+                    "relative motion only, celestial propagation disabled."
+                )
+            else:
+                logger.info("IMU sensor-to-telescope mapping is VERIFIED.")
+
+            self.stream = ImuSerialStream(
+                port=self.port,
+                baudrate=115200,
+            )
+            self.stream.start()
+
+            self._worker_stop_event.clear()
+            self._continuity_id += 1
+            with self._attitude_lock:
+                self._latest_attitude = None
+                self._latest_snapshot = None
+                self._orientation_history.clear()
+            self._worker_thread = threading.Thread(
+                target=self._run_estimator,
+                name="PushNav-IMU-Estimator",
+                daemon=True,
+            )
+            self._worker_thread.start()
+
+            logger.info(
+                "IMU reader and estimator started on %s at 115200 baud.",
+                self.port,
+            )
+            return True
+
+        except Exception:
+            logger.exception("IMU startup failed; continuing without IMU.")
+            self.stop()
+            self.stream = None
+            self.estimator = None
+            return False
+
+    def calibrate_stationary_gyro(
+        self,
+        *,
+        minimum_samples: int = 200,
+        maximum_samples: int = 500,
+        maximum_sample_age_s: float = 0.5,
+        maximum_window_s: float = 6.0,
+    ) -> Calibration:
+        """Calibrate gyro bias from recent stationary samples and save atomically.
+
+        Existing calibration remains untouched if collection, validation, or
+        persistence fails. The running estimator receives the new calibration
+        only after the file has been successfully replaced.
+        """
+        stream = self.stream
+        if stream is None or self.estimator is None:
+            raise RuntimeError("IMU is not running")
+
+        now = time.monotonic()
+        records = stream.history.snapshot()
+        records = [
+            record for record in records
+            if 0.0 <= now - record.received_at_monotonic <= maximum_window_s
+        ]
+
+        if not records:
+            raise RuntimeError("No recent IMU samples; start the IMU and retry")
+
+        latest_age = now - records[-1].received_at_monotonic
+        if latest_age > maximum_sample_age_s:
+            raise RuntimeError(
+                f"IMU samples are stale ({latest_age:.2f}s); check the sensor connection"
+            )
+
+        records = records[-maximum_samples:]
+        samples = [record.sample for record in records]
+
+        calibration = calibrate_stationary(
+            samples,
+            minimum_samples=minimum_samples,
+        )
+
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        calibration_path = self.config_dir / "imu_calibration.json"
+        temp_path = None
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.config_dir,
+                prefix="imu_calibration_",
+                suffix=".tmp",
+                delete=False,
+            ) as temp_file:
+                temp_path = Path(temp_file.name)
+                json.dump(calibration.to_dict(), temp_file, indent=2)
+                temp_file.write("\n")
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+
+            os.replace(temp_path, calibration_path)
+            temp_path = None
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Could not remove temporary calibration file")
+
+        # Swap the immutable calibration object after durable persistence.
+        # This does not change sensor alignment or reset the orientation.
+        self.estimator.cal = calibration
+        logger.info(
+            "Stationary IMU gyro calibration saved (%d samples)",
+            calibration.sample_count,
+        )
+        return calibration
+
+    def _run_estimator(self) -> None:
+        """Process records once; a >250 ms gap starts a new attitude epoch."""
+        last_device_time_us: int | None = None
+        try:
+            while not self._worker_stop_event.is_set():
+                if self.stream is None or self.estimator is None:
+                    break
+                records = self.stream.history.snapshot()
+                for record in records:
+                    if self._worker_stop_event.is_set():
+                        break
+                    if last_device_time_us is not None:
+                        if record.device_time_us <= last_device_time_us:
+                            continue
+                        gap_us = record.device_time_us - last_device_time_us
+                        if gap_us > self._max_contiguous_gap_us:
+                            with self._estimator_lock:
+                                self.estimator.reset_reference()
+                            self._continuity_id += 1
+                            with self._attitude_lock:
+                                self._latest_attitude = None
+                                self._latest_snapshot = None
+                                self._orientation_history.clear()
+                            logger.warning(
+                                "IMU continuity lost (%.3fs gap); requiring a new "
+                                "gravity reference and plate-solve anchor",
+                                gap_us / 1_000_000.0,
+                            )
+                    with self._estimator_lock:
+                        attitude = self.estimator.update(
+                            record.sample, device_time_us=record.device_time_us
+                        )
+                        quaternion = tuple(self.estimator.q)
+                    last_device_time_us = record.device_time_us
+                    published = replace(
+                        attitude,
+                        sample_age_s=max(
+                            0.0, time.monotonic() - record.received_at_monotonic
+                        ),
+                    )
+                    snapshot = ImuSnapshot(
+                        attitude=published,
+                        quaternion=quaternion,
+                        device_time_us=record.device_time_us,
+                        received_at_monotonic=record.received_at_monotonic,
+                        raw_sample=record.sample,
+                        continuity_id=self._continuity_id,
+                    )
+                    with self._attitude_lock:
+                        self._latest_attitude = published
+                        self._latest_snapshot = snapshot
+                        self._orientation_history.append(snapshot)
+                time.sleep(0.005)
+        except Exception:
+            logger.exception("IMU estimator worker failed.")
+
+    def stop(self) -> None:
+        """Stop serial ingestion and then the estimator worker."""
+        if self.stream is not None:
+            self.stream.stop(join_timeout=2.0)
+
+        self._worker_stop_event.set()
+
+        if self._worker_thread is not None:
+            self._worker_thread.join(timeout=2.0)
+            if not self._worker_thread.is_alive():
+                self._worker_thread = None
+
+        if self.stream is not None:
+            logger.info("IMU reader stopped.")
+            self.stream = None
+
+
+============================================================
+CONFIG: sensor_alignment.json
+{
+  "description": "Provisional commissioning configuration for the Obsidian Newtonian. Arduino and MPU boards are on top of the tube; MPU component side faces sky; MPU header pins point toward the front aperture, away from the primary mirror.",
+  "telescope_frame": {
+    "x": "along tube toward front aperture",
+    "y": "transverse axis completing a right-handed frame",
+    "z": "up toward sky when tube is horizontal"
+  },
+  "sensor_to_telescope": [
+    [1, 0, 0],
+    [0, 1, 0],
+    [0, 0, 1]
+  ],
+  "mapping_status": "PROVISIONAL_UNVERIFIED",
+  "altitude_sign": 1,
+  "azimuth_sign": 1,
+  "notes": [
+    "The identity matrix remains a provisional placeholder; breakout X/Y axis signs are not fully identified.",
+    "Observed convention in the user's tests: raising the front aperture produced positive pitch; counterclockwise azimuth rotation viewed from above produced positive yaw.",
+    "The output aliases pitch to relative altitude and yaw to relative azimuth. These are relative changes from the stream startup reference, not absolute telescope coordinates.",
+    "The first valid accelerometer sample establishes the startup tilt reference. Startup position need not be exactly horizontal.",
+    "The MPU-6050 has no magnetometer. Relative azimuth drifts and must be periodically corrected by PushNav plate solving.",
+    "Do not use this provisional mapping for precision pointing until full sensor-to-telescope alignment is verified."
+  ],
+  "accel_kp_per_second": 2.0,
+  "min_accel_g": 0.85,
+  "max_accel_g": 1.15
+}
+
+
+============================================================
+CONFIG: imu_calibration.json
+{
+  "gyro_bias_dps": [
+    -1.1047569035298939,
+    0.03303960243864952,
+    -0.47020082996055124
+  ],
+  "accel_mean_g": [
+    -0.04506508231963087,
+    0.04555262623217282,
+    1.0012079226090604
+  ],
+  "gyro_noise_dps": [
+    0.04259912216036128,
+    0.05505422701443494,
+    0.04548307057444258
+  ],
+  "sample_count": 2980
+}
+
+============================================================
+LIVE WORKFLOW API
+{
+  "active_sweep": null,
+  "sensor_sweep_count": 0,
+  "sensor_sweeps": [],
+  "camera_pair_count": 0,
+  "trusted_camera_pair_count": 0,
+  "sensor_fit": null,
+  "camera_fit": null,
+  "camera_timing_ready": false,
+  "ready_to_finalize": false,
+  "available": true,
+  "camera_capture_active": false
+}
