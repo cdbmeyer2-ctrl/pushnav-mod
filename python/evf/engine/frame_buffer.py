@@ -1,53 +1,53 @@
 # Copyright (C) 2026 Arun Venkataswamy
-#
-# This file is part of PushNav.
-#
-# PushNav is free software: you can redistribute it and/or modify it
-# under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# PushNav is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-# General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with PushNav. If not, see <https://www.gnu.org/licenses/>.
+# This file is part of PushNav; see LICENSE for terms.
 
-"""Thread-safe single-frame buffer. Only stores the most recent frame."""
+"""Thread-safe single-frame buffer retaining camera timestamp provenance."""
 
+from dataclasses import dataclass
 import threading
 
 
-class LatestFrame:
-    """Latest-frame buffer — no queue, no history.
+@dataclass(frozen=True)
+class FrameMetadata:
+    timestamp_source: str = "legacy_tcp_receipt"
+    timestamp_quality: str = "untrusted"
+    sample_time_100ns: int | None = None
+    sample_time_valid: bool = False
+    timing_uncertainty_s: float | None = None
 
-    set() overwrites unconditionally.
-    get() returns a snapshot (jpeg_bytes, timestamp, frame_id) or None.
-    """
+
+class LatestFrame:
+    """Latest-frame buffer; legacy get() tuple remains backward compatible."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._jpeg_bytes: bytes | None = None
         self._timestamp: float = 0.0
         self._frame_id: int = 0
+        self._metadata = FrameMetadata()
 
-    def set(self, jpeg_bytes: bytes, timestamp: float, frame_id: int) -> None:
+    def set(self, jpeg_bytes: bytes, timestamp: float, frame_id: int,
+            metadata: FrameMetadata | None = None) -> None:
         with self._lock:
             if frame_id <= self._frame_id:
-                return  # reject stale / lower-priority frames
+                return
             self._jpeg_bytes = jpeg_bytes
             self._timestamp = timestamp
             self._frame_id = frame_id
+            self._metadata = metadata or FrameMetadata()
 
     def get(self) -> tuple[bytes | None, float, int]:
-        """Return (jpeg_bytes, timestamp, frame_id). jpeg_bytes is None if empty."""
         with self._lock:
             return self._jpeg_bytes, self._timestamp, self._frame_id
+
+    def get_with_metadata(self):
+        with self._lock:
+            return (self._jpeg_bytes, self._timestamp, self._frame_id,
+                    self._metadata)
 
     def clear(self) -> None:
         with self._lock:
             self._jpeg_bytes = None
             self._timestamp = 0.0
             self._frame_id = 0
+            self._metadata = FrameMetadata()
