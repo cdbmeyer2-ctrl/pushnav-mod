@@ -1,0 +1,125 @@
+{
+  "description": "Synthetic-only plate-solve anchor and controlled IMU sequence",
+  "quaternion_convention": "WXYZ",
+  "anchor": {
+    "frame_id": 1001,
+    "frame_timestamp": 1000.0,
+    "ra_deg": 120.0,
+    "dec_deg": 30.0,
+    "roll_deg": 0.0,
+    "valid": true,
+    "imu_anchor_quaternion_wxyz": [
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "sensor_mapping_status": "VERIFIED",
+    "camera_alignment_status": "VERIFIED",
+    "synthetic_only": true
+  },
+  "samples": [
+    {
+      "host_timestamp": 1000.0,
+      "imu_device_time_us": 1000000000,
+      "quaternion_wxyz": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "gyro_dps_xyz": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "altitude_command_deg": 0.0,
+      "roll_command_deg": 0.0
+    },
+    {
+      "host_timestamp": 1000.25,
+      "imu_device_time_us": 1000250000,
+      "quaternion_wxyz": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "gyro_dps_xyz": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "altitude_command_deg": 0.0,
+      "roll_command_deg": 0.0
+    },
+    {
+      "host_timestamp": 1000.5,
+      "imu_device_time_us": 1000500000,
+      "quaternion_wxyz": [
+        0.9990482215818578,
+        0.0,
+        0.043619387365336,
+        0.0
+      ],
+      "gyro_dps_xyz": [
+        0.0,
+        20.0,
+        0.0
+      ],
+      "altitude_command_deg": 5.0,
+      "roll_command_deg": 0.0
+    },
+    {
+      "host_timestamp": 1000.75,
+      "imu_device_time_us": 1000750000,
+      "quaternion_wxyz": [
+        0.9961946980917455,
+        0.0,
+        0.08715574274765817,
+        0.0
+      ],
+      "gyro_dps_xyz": [
+        0.0,
+        20.0,
+        0.0
+      ],
+      "altitude_command_deg": 10.0,
+      "roll_command_deg": 0.0
+    },
+    {
+      "host_timestamp": 1001.0,
+      "imu_device_time_us": 1001000000,
+      "quaternion_wxyz": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "gyro_dps_xyz": [
+        0.0,
+        -40.0,
+        0.0
+      ],
+      "altitude_command_deg": 0.0,
+      "roll_command_deg": 0.0
+    },
+    {
+      "host_timestamp": 1001.25,
+      "imu_device_time_us": 1001250000,
+      "quaternion_wxyz": [
+        0.9914448613738104,
+        0.0,
+        0.0,
+        0.13052619222005157
+      ],
+      "gyro_dps_xyz": [
+        0.0,
+        0.0,
+        60.0
+      ],
+      "altitude_command_deg": 0.0,
+      "roll_command_deg": 15.0
+    }
+  ]
+}
