@@ -53,7 +53,7 @@ class SolverThread:
         state_machine: StateMachine,
         config: ConfigManager,
         audio: AudioAlert | None = None,
-        on_plate_solve: Callable[[PointingSnapshot, float, int], None] | None = None,
+        on_plate_solve: Callable[..., None] | None = None,
     ) -> None:
         self._solver = solver
         self._frame_buffer = frame_buffer
