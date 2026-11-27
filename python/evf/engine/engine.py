@@ -489,8 +489,22 @@ class Engine:
                 raise ValueError("IMU sensor-to-telescope mapping is not VERIFIED")
             if alignment.get("camera_from_telescope_status") != "VERIFIED":
                 raise ValueError("camera_from_telescope calibration is not VERIFIED")
-            if alignment.get("camera_timing_status") != "VERIFIED_CALLBACK_QPC":
-                raise ValueError("camera frame clock/timing calibration is not VERIFIED")
+            timing = alignment.get("camera_timing_evidence")
+            if (
+                alignment.get("camera_timing_status") != "VERIFIED_EXPOSURE_MIDPOINT"
+                or not isinstance(timing, dict)
+                or timing.get("timestamp_quality") != "exposure_midpoint"
+                or timing.get("exposure_midpoint_verified") is not True
+                or timing.get("evidence_origin") != "physical"
+                or timing.get("clock_sync_verified") is not True
+                or not isinstance(timing.get("timing_uncertainty_s"), (int, float))
+                or not np.isfinite(timing["timing_uncertainty_s"])
+                or not 0.0 <= timing["timing_uncertainty_s"] <= 0.010
+            ):
+                raise ValueError(
+                    "camera exposure-midpoint timing is not physically verified "
+                    "with <=10 ms uncertainty"
+                )
 
             matrix = np.asarray(alignment["camera_from_telescope"], dtype=float)
             if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
@@ -945,17 +959,25 @@ class Engine:
             and getattr(service, "sensor_mapping_verified", False)
         )
 
-        timing_quality = getattr(frame_metadata, "timestamp_quality", "untrusted")
-        timing_clock_verified = bool(
-            getattr(frame_metadata, "clock_sync_verified", False)
+        timing_uncertainty = getattr(frame_metadata, "timing_uncertainty_s", None)
+        try:
+            timing_uncertainty = float(timing_uncertainty)
+        except (TypeError, ValueError):
+            timing_uncertainty = float("inf")
+        timing_verified = bool(
+            getattr(frame_metadata, "timestamp_quality", "untrusted") == "exposure_midpoint"
+            and getattr(frame_metadata, "clock_sync_verified", False) is True
+            and getattr(frame_metadata, "exposure_midpoint_verified", False) is True
+            and getattr(frame_metadata, "evidence_origin", "untrusted") == "physical"
+            and math.isfinite(timing_uncertainty)
+            and 0.0 <= timing_uncertainty <= 0.010
         )
         if (
             not pointing.valid
             or service is None
             or not sensor_mapping_verified
             or camera_from_telescope is None
-            or timing_quality != "callback"
-            or not timing_clock_verified
+            or not timing_verified
         ):
             with self._plate_solve_anchor_lock:
                 self._plate_solve_anchor = None
@@ -1130,12 +1152,17 @@ class Engine:
         timing_evidence = measured.get("camera_timing_evidence")
         if (
             not isinstance(timing_evidence, dict)
-            or timing_evidence.get("timestamp_source") != "directshow_sample_callback_qpc"
+            or timing_evidence.get("timestamp_quality") != "exposure_midpoint"
+            or timing_evidence.get("exposure_midpoint_verified") is not True
+            or timing_evidence.get("evidence_origin") != "physical"
             or timing_evidence.get("clock_sync_verified") is not True
+            or not isinstance(timing_evidence.get("timing_uncertainty_s"), (int, float))
+            or not np.isfinite(timing_evidence["timing_uncertainty_s"])
+            or not 0.0 <= timing_evidence["timing_uncertainty_s"] <= 0.010
         ):
             raise RuntimeError(
-                "Camera timing evidence is not verified; collect pairs from the "
-                "native Windows DirectShow v2 camera server"
+                "Camera exposure-midpoint timing must be physically verified "
+                "with <=10 ms uncertainty; callback/QPC timing is insufficient"
             )
         sensor_matrix = np.asarray(measured["sensor_to_telescope"], dtype=float)
         camera_matrix = np.asarray(measured["camera_from_telescope"], dtype=float)
@@ -1160,11 +1187,11 @@ class Engine:
             "mapping_status": "VERIFIED",
             "camera_from_telescope": camera_matrix.tolist(),
             "camera_from_telescope_status": "VERIFIED",
-            "camera_timing_status": "VERIFIED_CALLBACK_QPC",
+            "camera_timing_status": "VERIFIED_EXPOSURE_MIDPOINT",
+            "camera_timing_evidence": timing_evidence,
             "camera_timing_note": (
-                "QPC timestamp is sampled in DirectShow SampleCB. This verifies "
-                "the host clock domain, not sensor exposure midpoint; perform "
-                "physical stationary/motion validation before relying on tracking."
+                "Exposure-midpoint timing independently measured and verified "
+                "with uncertainty <=10 ms."
             ),
             "calibration_evidence": measured,
         })
