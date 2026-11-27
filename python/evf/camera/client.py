@@ -113,7 +113,7 @@ class CameraClient:
         if cam_version not in (1, 2):
             raise ProtocolError(f"Unsupported camera protocol version: {cam_version}")
 
-        our_hello = {"protocol_version": PROTOCOL_VERSION, "app": "evf", "app_version": "0.3.0"}
+        our_hello = {"protocol_version": cam_version, "app": "evf", "app_version": "0.3.0"}
         self._sock.sendall(encode_json_message(MSG_HELLO, our_hello))
 
         msg_type, payload = read_message(self._sock)
