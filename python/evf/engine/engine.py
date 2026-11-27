@@ -1126,6 +1126,16 @@ class Engine:
         if workflow is None or service is None:
             raise RuntimeError("IMU workflow is not running")
         measured = workflow.measured_result()
+        timing_evidence = measured.get("camera_timing_evidence")
+        if (
+            not isinstance(timing_evidence, dict)
+            or timing_evidence.get("timestamp_source") != "directshow_sample_callback_qpc"
+            or timing_evidence.get("clock_sync_verified") is not True
+        ):
+            raise RuntimeError(
+                "Camera timing evidence is not verified; collect pairs from the "
+                "native Windows DirectShow v2 camera server"
+            )
         sensor_matrix = np.asarray(measured["sensor_to_telescope"], dtype=float)
         camera_matrix = np.asarray(measured["camera_from_telescope"], dtype=float)
         if not getattr(service, "sensor_mapping_verified", False):
