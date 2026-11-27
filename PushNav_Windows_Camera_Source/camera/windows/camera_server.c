@@ -1128,16 +1128,16 @@ static void build_hello_json(char *buf, size_t buflen)
     char escaped_model[256];
     json_escape(escaped_model, sizeof(escaped_model), camera_model);
     snprintf(buf, buflen,
-        "{\\"protocol_version\\":2,"
-        "\\"backend\\":\\"windows-directshow\\","
-        "\\"backend_version\\":\\"0.2.0\\","
-        "\\"camera_model\\":\\"%s\\","
-        "\\"stream_format\\":\\"MJPEG\\","
-        "\\"timestamp_clock\\":\\"windows_qpc\\","
-        "\\"frame_metadata\\":\\"PNF2\\","
-        "\\"default_width\\":%d,"
-        "\\"default_height\\":%d,"
-        "\\"default_fps\\":30}",
+        "{\"protocol_version\":2,"
+        "\"backend\":\"windows-directshow\","
+        "\"backend_version\":\"0.2.0\","
+        "\"camera_model\":\"%s\","
+        "\"stream_format\":\"MJPEG\","
+        "\"timestamp_clock\":\"windows_qpc\","
+        "\"frame_metadata\":\"PNF2\","
+        "\"default_width\":%d,"
+        "\"default_height\":%d,"
+        "\"default_fps\":30}",
         escaped_model, CAPTURE_W, CAPTURE_H);
 }
 
@@ -1332,7 +1332,7 @@ static void handle_client(SOCKET client_fd)
     if (!QueryPerformanceCounter(&qpc) || g_qpc_frequency.QuadPart <= 0) return;
     char sync[160];
     snprintf(sync, sizeof(sync),
-        "{\\"qpc_ticks\\":%llu,\\"qpc_frequency\\":%llu}",
+        "{\"qpc_ticks\":%llu,\"qpc_frequency\":%llu}",
         (unsigned long long)qpc.QuadPart,
         (unsigned long long)g_qpc_frequency.QuadPart);
     if (send_json_message(client_fd, MSG_CLOCK_SYNC, sync) < 0) return;
