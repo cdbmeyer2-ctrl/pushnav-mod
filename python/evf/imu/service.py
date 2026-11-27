@@ -152,6 +152,7 @@ class ImuService:
                 raise RuntimeError("IMU estimator is not initialized")
             self.estimator.set_sensor_to_telescope(matrix)
             self.sensor_mapping_verified = True
+            self._continuity_id += 1
             with self._attitude_lock:
                 self._latest_attitude = None
                 self._latest_snapshot = None
