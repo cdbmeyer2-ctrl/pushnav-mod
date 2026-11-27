@@ -209,7 +209,7 @@ def test_camera_fit_rejects_repeated_identical_attitudes(tmp_path):
         )
         workflow.capture_camera_pair(pointing, timestamp, frame_id, metadata)
 
-    with pytest.raises(ValueError, match="coverage|attitude"):
+    with pytest.raises(ValueError, match="distinct|coverage|attitude"):
         workflow.fit_camera_alignment()
 
 
