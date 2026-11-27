@@ -23,6 +23,7 @@ Per SPEC_PROTOCOL_CAMERA.md §4–5 and SPEC_ARCHITECTURE.md §4.1/§7.
 import json
 import logging
 import socket
+import struct
 import threading
 import time
 
