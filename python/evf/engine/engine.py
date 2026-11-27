@@ -488,6 +488,8 @@ class Engine:
                 raise ValueError("IMU sensor-to-telescope mapping is not VERIFIED")
             if alignment.get("camera_from_telescope_status") != "VERIFIED":
                 raise ValueError("camera_from_telescope calibration is not VERIFIED")
+            if alignment.get("camera_timing_status") != "VERIFIED_CALLBACK_QPC":
+                raise ValueError("camera frame clock/timing calibration is not VERIFIED")
 
             matrix = np.asarray(alignment["camera_from_telescope"], dtype=float)
             if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
@@ -879,6 +881,17 @@ class Engine:
                 if snapshot is None:
                     continue
                 if time.monotonic() - snapshot.received_at_monotonic > 0.25:
+                    with self._plate_solve_anchor_lock:
+                        if self._plate_solve_anchor == anchor:
+                            self._plate_solve_anchor = None
+                    continue
+                if getattr(snapshot, "continuity_id", 0) != anchor.continuity_id:
+                    with self._plate_solve_anchor_lock:
+                        if self._plate_solve_anchor == anchor:
+                            self._plate_solve_anchor = None
+                    logger.warning(
+                        "IMU continuity epoch changed; waiting for a fresh plate solve"
+                    )
                     continue
 
                 key = (anchor.frame_id, snapshot.device_time_us)
@@ -906,7 +919,8 @@ class Engine:
                 logger.exception("IMU pointing propagation failed")
 
     def _capture_plate_solve_anchor(
-        self, pointing: PointingSnapshot, frame_timestamp: float, frame_id: int
+        self, pointing: PointingSnapshot, frame_timestamp: float, frame_id: int,
+        frame_metadata=None,
     ) -> None:
         """Pair a plate solve with IMU orientation and a verified body transform."""
         workflow = self._imu_alignment_workflow
@@ -916,7 +930,9 @@ class Engine:
             and pointing.valid
         ):
             try:
-                workflow.capture_camera_pair(pointing, frame_timestamp, frame_id)
+                workflow.capture_camera_pair(
+                    pointing, frame_timestamp, frame_id, frame_metadata
+                )
             except Exception as exc:
                 logger.debug("IMU camera calibration pair rejected: %s", exc)
 
@@ -928,11 +944,13 @@ class Engine:
             and getattr(service, "sensor_mapping_verified", False)
         )
 
+        timing_quality = getattr(frame_metadata, "timestamp_quality", "untrusted")
         if (
             not pointing.valid
             or service is None
             or not sensor_mapping_verified
             or camera_from_telescope is None
+            or timing_quality != "callback"
         ):
             with self._plate_solve_anchor_lock:
                 self._plate_solve_anchor = None
@@ -953,6 +971,11 @@ class Engine:
             return
 
         device_time_us, quaternion = orientation
+        current_snapshot = service.latest_snapshot
+        if current_snapshot is None:
+            with self._plate_solve_anchor_lock:
+                self._plate_solve_anchor = None
+            return
         camera_to_sky = orientation_from_radec_roll(
             pointing.ra_j2000, pointing.dec_j2000, pointing.roll
         )
@@ -971,6 +994,7 @@ class Engine:
                 tuple(float(value) for value in row)
                 for row in telescope_to_sky
             ),
+            continuity_id=getattr(current_snapshot, "continuity_id", 0),
         )
         with self._plate_solve_anchor_lock:
             self._plate_solve_anchor = anchor
@@ -1121,6 +1145,12 @@ class Engine:
             "mapping_status": "VERIFIED",
             "camera_from_telescope": camera_matrix.tolist(),
             "camera_from_telescope_status": "VERIFIED",
+            "camera_timing_status": "VERIFIED_CALLBACK_QPC",
+            "camera_timing_note": (
+                "QPC timestamp is sampled in DirectShow SampleCB. This verifies "
+                "the host clock domain, not sensor exposure midpoint; perform "
+                "physical stationary/motion validation before relying on tracking."
+            ),
             "calibration_evidence": measured,
         })
         temp_name = None
