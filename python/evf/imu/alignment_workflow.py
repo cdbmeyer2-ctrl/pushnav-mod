@@ -367,8 +367,10 @@ class ImuAlignmentWorkflow:
         for item in sweeps:
             source.append(item.sensor_axis)
             if item.axis == "altitude":
-                target.append((0.0, 1.0, 0.0))
+                # Right-handed telescope frame: raising the aperture is -Y.
+                target.append((0.0, -1.0, 0.0))
             else:
+                # Positive azimuth is CCW viewed from above (+Z).
                 target.append((0.0, 0.0, 1.0))
 
         matrix, rms, errors = sensor_to_telescope_from_sweep_axes(
