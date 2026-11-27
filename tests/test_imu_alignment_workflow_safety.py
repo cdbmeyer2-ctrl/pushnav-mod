@@ -234,6 +234,11 @@ def test_finalization_rejects_incomplete_or_unverified_calibration(tmp_path):
         "sensor_to_telescope": np.eye(3).tolist(),
         "camera_from_telescope": np.eye(3).tolist(),
         "calibration_method": "synthetic_test_only",
+        "camera_timing_evidence": {
+            "timestamp_source": "directshow_sample_callback_qpc",
+            "clock_sync_verified": True,
+            "exposure_midpoint_verified": False,
+        },
     }
     engine._imu_alignment_workflow = SimpleNamespace(
         measured_result=lambda: valid_measured
@@ -261,6 +266,11 @@ def test_finalization_persists_and_reload_validates_transforms(tmp_path):
         "sensor_to_telescope": np.eye(3).tolist(),
         "camera_from_telescope": np.eye(3).tolist(),
         "calibration_method": "synthetic_test_only",
+        "camera_timing_evidence": {
+            "timestamp_source": "directshow_sample_callback_qpc",
+            "clock_sync_verified": True,
+            "exposure_midpoint_verified": False,
+        },
     }
     engine._imu_alignment_workflow = SimpleNamespace(
         measured_result=lambda: measured
