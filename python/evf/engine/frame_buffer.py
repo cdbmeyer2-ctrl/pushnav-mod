@@ -14,6 +14,7 @@ class FrameMetadata:
     sample_time_100ns: int | None = None
     sample_time_valid: bool = False
     timing_uncertainty_s: float | None = None
+    clock_sync_verified: bool = False
 
 
 class LatestFrame:
