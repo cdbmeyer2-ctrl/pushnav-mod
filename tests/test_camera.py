@@ -37,6 +37,8 @@ from evf.camera.protocol import (
     encode_message,
     read_message,
     type_name,
+    encode_frame_metadata,
+    decode_frame_payload,
 )
 from evf.camera.client import CameraClient, ProtocolError
 from evf.engine.frame_buffer import LatestFrame
@@ -77,6 +79,33 @@ class TestProtocolCodec:
 
     def test_type_name_unknown(self):
         assert "UNKNOWN" in type_name(0xFF)
+
+
+class TestFrameMetadata:
+    def test_v2_metadata_round_trip(self):
+        payload = encode_frame_metadata(
+            frame_id=12, qpc_ticks=10_000_000, qpc_frequency=10_000_000,
+            sample_time_100ns=123456, flags=1,
+        ) + b"\\xff\\xd8jpeg"
+        jpeg, metadata = decode_frame_payload(payload)
+        assert jpeg == b"\\xff\\xd8jpeg"
+        assert metadata["frame_id"] == 12
+        assert metadata["timestamp"] == 1.0
+        assert metadata["timestamp_quality"] == "callback"
+        assert metadata["sample_time_valid"] is True
+
+    def test_legacy_frame_is_explicitly_untrusted(self):
+        jpeg, metadata = decode_frame_payload(b"\\xff\\xd8legacy")
+        assert jpeg == b"\\xff\\xd8legacy"
+        assert metadata["timestamp_quality"] == "untrusted"
+        assert metadata["frame_id"] is None
+
+    def test_invalid_qpc_metadata_is_rejected(self):
+        import struct
+        from evf.camera.protocol import FRAME_META_FMT, FRAME_META_MAGIC
+        bad = struct.pack(FRAME_META_FMT, FRAME_META_MAGIC, 0, 1, 1, 0, 0) + b"jpeg"
+        with pytest.raises(ValueError, match="invalid frame"):
+            decode_frame_payload(bad)
 
 
 # ---------------------------------------------------------------------------
