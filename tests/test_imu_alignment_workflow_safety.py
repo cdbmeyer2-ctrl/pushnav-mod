@@ -178,8 +178,12 @@ def test_missing_frame_time_imu_orientation_is_rejected(tmp_path):
         roll=0.0,
     )
 
+    metadata = SimpleNamespace(
+        timestamp_quality="callback", clock_sync_verified=True,
+        timing_uncertainty_s=None,
+    )
     with pytest.raises(ValueError, match="orientation"):
-        workflow.capture_camera_pair(pointing, 123.0, 1)
+        workflow.capture_camera_pair(pointing, 123.0, 1, metadata)
 
 
 def test_camera_fit_rejects_repeated_identical_attitudes(tmp_path):
@@ -199,7 +203,11 @@ def test_camera_fit_rejects_repeated_identical_attitudes(tmp_path):
             frame_id * 1_000_000,
             identity_quaternion,
         )
-        workflow.capture_camera_pair(pointing, timestamp, frame_id)
+        metadata = SimpleNamespace(
+            timestamp_quality="callback", clock_sync_verified=True,
+            timing_uncertainty_s=None,
+        )
+        workflow.capture_camera_pair(pointing, timestamp, frame_id, metadata)
 
     with pytest.raises(ValueError, match="coverage|attitude"):
         workflow.fit_camera_alignment()
