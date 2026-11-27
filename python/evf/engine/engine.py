@@ -945,12 +945,16 @@ class Engine:
         )
 
         timing_quality = getattr(frame_metadata, "timestamp_quality", "untrusted")
+        timing_clock_verified = bool(
+            getattr(frame_metadata, "clock_sync_verified", False)
+        )
         if (
             not pointing.valid
             or service is None
             or not sensor_mapping_verified
             or camera_from_telescope is None
             or timing_quality != "callback"
+            or not timing_clock_verified
         ):
             with self._plate_solve_anchor_lock:
                 self._plate_solve_anchor = None
@@ -1214,6 +1218,9 @@ class Engine:
             ),
             "camera_alignment_status": (
                 "VERIFIED" if camera_verified else "UNVERIFIED"
+            ),
+            "camera_timing_status": saved.get(
+                "camera_timing_status", "UNVERIFIED"
             ),
             "sensor_to_telescope": (
                 saved.get("sensor_to_telescope") if sensor_verified else None
