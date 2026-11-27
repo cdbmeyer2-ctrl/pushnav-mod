@@ -30,6 +30,7 @@ class ImuSnapshot:
     device_time_us: int
     received_at_monotonic: float
     raw_sample: RawSample
+    continuity_id: int = 0
 
 
 class ImuService:
@@ -51,7 +52,9 @@ class ImuService:
         self._estimator_lock = threading.Lock()
         self._latest_attitude: Attitude | None = None
         self._latest_snapshot: ImuSnapshot | None = None
-        self._orientation_history: deque[ImuSnapshot] = deque(maxlen=2000)\n        self._continuity_id = 0\n        self._max_contiguous_gap_us = 250_000
+        self._orientation_history: deque[ImuSnapshot] = deque(maxlen=2000)
+        self._continuity_id = 0
+        self._max_contiguous_gap_us = 250_000
 
     @property
     def latest_attitude(self) -> Attitude | None:
