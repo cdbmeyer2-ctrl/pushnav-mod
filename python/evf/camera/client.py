@@ -277,6 +277,7 @@ class CameraClient:
                 sample_time_100ns=metadata["sample_time_100ns"],
                 sample_time_valid=metadata["sample_time_valid"],
                 timing_uncertainty_s=metadata["timing_uncertainty_s"],
+                clock_sync_verified=bool(self._clock_sync.get("verified_same_host_clock")),
             )
             self._frame_buffer.set(jpeg, timestamp, frame_id, frame_meta)
         elif msg_type == MSG_CONTROL_INFO:
