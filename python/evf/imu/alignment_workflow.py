@@ -97,9 +97,23 @@ class ImuAlignmentWorkflow:
                 ),
                 "sensor_fit": self._sensor_fit,
                 "camera_fit": self._camera_fit,
+                "camera_timing_ready": (
+                    len(self._camera_pairs) >= self.MIN_CAMERA_PAIRS
+                    and all(
+                        item.timestamp_quality == "callback"
+                        and item.clock_sync_verified
+                        for item in self._camera_pairs
+                    )
+                ),
                 "ready_to_finalize": (
                     self._sensor_fit is not None
                     and self._camera_fit is not None
+                    and len(self._camera_pairs) >= self.MIN_CAMERA_PAIRS
+                    and all(
+                        item.timestamp_quality == "callback"
+                        and item.clock_sync_verified
+                        for item in self._camera_pairs
+                    )
                 ),
             }
 
