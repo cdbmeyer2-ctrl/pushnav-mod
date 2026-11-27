@@ -905,6 +905,8 @@ static HRESULT STDMETHODCALLTYPE sample_cb_sample(
 {
     (void)iface; (void)sample_time;
     if (!sample || !g_frame_sync_initialized) return S_OK;
+    LARGE_INTEGER qpc;
+    if (!QueryPerformanceCounter(&qpc)) return S_OK;
     BYTE *source = NULL;
     HRESULT hr = sample->lpVtbl->GetPointer(sample, &source);
     if (FAILED(hr) || !source) return S_OK;
@@ -934,8 +936,6 @@ static HRESULT STDMETHODCALLTYPE sample_cb_sample(
 #endif
     }
 
-    LARGE_INTEGER qpc;
-    if (!QueryPerformanceCounter(&qpc)) { free(frame); return S_OK; }
     REFERENCE_TIME sample_start = 0, sample_end = 0;
     DWORD flags = 0;
     if (SUCCEEDED(sample->lpVtbl->GetTime(sample, &sample_start, &sample_end)))
