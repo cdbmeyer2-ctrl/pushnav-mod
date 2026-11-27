@@ -38,6 +38,9 @@ class CameraPair:
     device_time_us: int
     quaternion: tuple[float, float, float, float]
     camera_to_sky: tuple[tuple[float, float, float], ...]
+    timestamp_quality: str = "untrusted"
+    clock_sync_verified: bool = False
+    timing_uncertainty_s: float | None = None
 
 
 class ImuAlignmentWorkflow:
@@ -88,6 +91,10 @@ class ImuAlignmentWorkflow:
                     for item in self._sweeps
                 ],
                 "camera_pair_count": len(self._camera_pairs),
+                "trusted_camera_pair_count": sum(
+                    item.timestamp_quality == "callback" and item.clock_sync_verified
+                    for item in self._camera_pairs
+                ),
                 "sensor_fit": self._sensor_fit,
                 "camera_fit": self._camera_fit,
                 "ready_to_finalize": (
@@ -342,10 +349,18 @@ class ImuAlignmentWorkflow:
             self._sensor_fit = result
         return result
 
-    def capture_camera_pair(self, pointing, frame_timestamp: float, frame_id: int):
-        """Capture IMU orientation paired to the actual solved camera frame."""
+    def capture_camera_pair(
+        self, pointing, frame_timestamp: float, frame_id: int, frame_metadata=None
+    ):
+        """Pair a solve with IMU orientation at a synchronized camera callback time."""
         if self.service is None:
             raise RuntimeError("IMU service is not running")
+        if frame_metadata is None:
+            raise ValueError("Camera frame has no timestamp provenance")
+        if getattr(frame_metadata, "timestamp_quality", "untrusted") != "callback":
+            raise ValueError("Camera frame timestamp is not a native callback timestamp")
+        if not getattr(frame_metadata, "clock_sync_verified", False):
+            raise ValueError("Camera QPC clock has not been synchronized to host monotonic")
 
         orientation = self.service.orientation_at_host_time(frame_timestamp)
         if orientation is None:
@@ -368,6 +383,9 @@ class ImuAlignmentWorkflow:
             camera_to_sky=tuple(
                 tuple(float(v) for v in row) for row in camera_matrix
             ),
+            timestamp_quality=frame_metadata.timestamp_quality,
+            clock_sync_verified=bool(frame_metadata.clock_sync_verified),
+            timing_uncertainty_s=frame_metadata.timing_uncertainty_s,
         )
 
         with self._lock:
@@ -434,13 +452,29 @@ class ImuAlignmentWorkflow:
                     "Both sensor and camera alignment fits must pass "
                     "before finalization"
                 )
+            if not self._camera_pairs or any(
+                item.timestamp_quality != "callback" or not item.clock_sync_verified
+                for item in self._camera_pairs
+            ):
+                raise ValueError(
+                    "Camera timing evidence is incomplete; capture all calibration "
+                    "pairs from the synchronized DirectShow v2 camera stream"
+                )
 
             return {
                 "sensor_to_telescope": self._sensor_fit["matrix"],
                 "camera_from_telescope": self._camera_fit["matrix"],
                 "sensor_evidence": self._sensor_fit,
                 "camera_evidence": self._camera_fit,
-                "calibration_method": "physical_sweeps_and_paired_plate_solves_v1",
+                "camera_timing_evidence": {
+                    "pair_count": len(self._camera_pairs),
+                    "frame_ids": [item.frame_id for item in self._camera_pairs],
+                    "timestamp_source": "directshow_sample_callback_qpc",
+                    "clock_sync_verified": True,
+                    "timing_uncertainty_s": None,
+                    "exposure_midpoint_verified": False,
+                },
+                "calibration_method": "physical_sweeps_and_paired_plate_solves_v2",
                 "created_at_unix": time.time(),
             }
 
