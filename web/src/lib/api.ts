@@ -1,0 +1,63 @@
+async function post(path: string, body?: unknown): Promise<void> {
+  const init: RequestInit = { method: "POST" };
+  if (body !== undefined) {
+    init.headers = { "Content-Type": "application/json" };
+    init.body = JSON.stringify(body);
+  }
+  const resp = await fetch(path, init);
+  if (resp.status >= 400) {
+    throw new Error(`POST ${path} → ${resp.status}: ${await resp.text()}`);
+  }
+}
+
+export const api = {
+  wizardAdvance: () => post("/api/wizard/advance"),
+  syncRetry: () => post("/api/sync/retry"),
+  syncSelect: (idx: number) => post("/api/sync/select", { idx }),
+  useCalibration: () => post("/api/calibration/use-previous"),
+  calibrateImuStationary: () => post("/api/imu/calibrate-stationary"),
+  imuAlignmentWorkflowStatus: async (): Promise<Record<string, unknown>> => {
+    const resp = await fetch("/api/imu/alignment-workflow");
+    if (resp.status >= 400) {
+      throw new Error(`GET /api/imu/alignment-workflow → ${resp.status}: ${await resp.text()}`);
+    }
+    return await resp.json();
+  },
+  imuAlignmentStartSweep: (axis: "altitude" | "azimuth", direction: -1 | 1) =>
+    post("/api/imu/alignment-workflow/sweep/start", { axis, direction }),
+  imuAlignmentFinishSweep: () => post("/api/imu/alignment-workflow/sweep/finish"),
+  imuAlignmentFitSensor: () => post("/api/imu/alignment-workflow/sensor/fit"),
+  imuAlignmentCameraCapture: (active: boolean) =>
+    post("/api/imu/alignment-workflow/camera/capture", { active }),
+  imuAlignmentFitCamera: () => post("/api/imu/alignment-workflow/camera/fit"),
+  imuAlignmentFinalize: () => post("/api/imu/alignment-workflow/finalize"),
+  imuAlignmentReset: () => post("/api/imu/alignment-workflow/reset"),
+  retryCamera: async (): Promise<{ connected: boolean }> => {
+    const resp = await fetch("/api/camera/retry", { method: "POST" });
+    if (resp.status >= 400) {
+      throw new Error(`POST /api/camera/retry → ${resp.status}: ${await resp.text()}`);
+    }
+    return await resp.json();
+  },
+  setControl: (name: string, value: number) => post("/api/control", { name, value }),
+  clearGoto: () => post("/api/goto/clear"),
+  setGoto: (ra_deg: number, dec_deg: number) =>
+    post("/api/goto/set", { ra_deg, dec_deg }),
+  setSettings: (s: {
+    audio_enabled?: boolean;
+    location?: { latitude: number; longitude: number } | null;
+    lx200_epoch?: "jnow" | "j2000";
+  }) => post("/api/settings", s),
+  setAdvanced: (s: { min_matches?: number; max_prob?: number }) =>
+    post("/api/settings", s),
+  dev: {
+    injectSample: (name: string | null) =>
+      post("/api/dev/inject-sample", { name }),
+    injectTarget: (ra_deg: number, dec_deg: number) =>
+      post("/api/dev/inject-target", { ra_deg, dec_deg }),
+    captureFrame: async (): Promise<{ path: string | null; error?: string }> => {
+      const resp = await fetch("/api/dev/capture-frame", { method: "POST" });
+      return await resp.json();
+    },
+  },
+};
