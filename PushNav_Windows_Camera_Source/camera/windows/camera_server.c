@@ -80,11 +80,9 @@ static const GUID CLSID_NullRenderer =
 #define INTERFACE ISampleGrabber
 
 DECLARE_INTERFACE_(ISampleGrabber, IUnknown) {
-    /* IUnknown */
     STDMETHOD(QueryInterface)(THIS_ REFIID riid, void **ppv) PURE;
     STDMETHOD_(ULONG, AddRef)(THIS) PURE;
     STDMETHOD_(ULONG, Release)(THIS) PURE;
-    /* ISampleGrabber */
     STDMETHOD(SetOneShot)(THIS_ BOOL oneShot) PURE;
     STDMETHOD(SetMediaType)(THIS_ const AM_MEDIA_TYPE *pType) PURE;
     STDMETHOD(GetConnectedMediaType)(THIS_ AM_MEDIA_TYPE *pType) PURE;
@@ -92,6 +90,20 @@ DECLARE_INTERFACE_(ISampleGrabber, IUnknown) {
     STDMETHOD(GetCurrentBuffer)(THIS_ long *pBufferSize, long *pBuffer) PURE;
     STDMETHOD(GetCurrentSample)(THIS_ void **ppSample) PURE;
     STDMETHOD(SetCallback)(THIS_ void *pCallback, long whichMethod) PURE;
+};
+
+static const GUID IID_ISampleGrabberCB =
+    {0x0579154A, 0x2B53, 0x4994,
+     {0xB0, 0xD0, 0xE7, 0x73, 0x14, 0x8E, 0xFF, 0x85}};
+
+#undef INTERFACE
+#define INTERFACE ISampleGrabberCB
+DECLARE_INTERFACE_(ISampleGrabberCB, IUnknown) {
+    STDMETHOD(QueryInterface)(THIS_ REFIID riid, void **ppv) PURE;
+    STDMETHOD_(ULONG, AddRef)(THIS) PURE;
+    STDMETHOD_(ULONG, Release)(THIS) PURE;
+    STDMETHOD(SampleCB)(THIS_ double SampleTime, IMediaSample *pSample) PURE;
+    STDMETHOD(BufferCB)(THIS_ double SampleTime, BYTE *pBuffer, long BufferLen) PURE;
 };
 
 /* ------------------------------------------------------------------ */
@@ -102,10 +114,15 @@ DECLARE_INTERFACE_(ISampleGrabber, IUnknown) {
 #define MSG_FRAME         0x01
 #define MSG_CONTROL_INFO  0x02
 #define MSG_ERROR         0x03
-#define MSG_SET_CONTROL   0x11
-#define MSG_GET_CONTROLS  0x12
+#define MSG_SET_CONTROL          0x11
+#define MSG_GET_CONTROLS         0x12
+#define MSG_CLOCK_SYNC_REQUEST   0x13
+#define MSG_CLOCK_SYNC           0x04
 
 #define HEADER_SIZE       8
+#define FRAME_META_SIZE   40
+#define FRAME_META_MAGIC  "PNF2"
+#define MAX_FRAME_BYTES   (16 * 1024 * 1024)
 
 /* ------------------------------------------------------------------ */
 /* Configuration                                                       */
@@ -145,8 +162,24 @@ typedef struct {
 static ctrl_range_t exposure_range;
 static ctrl_range_t gain_range;
 
-/* Shutdown flag */
+/* Shutdown + callback-driven frame state. */
 static volatile LONG stop_flag = 0;
+static CRITICAL_SECTION g_frame_lock;
+static HANDLE g_frame_event = NULL;
+static unsigned char *g_latest_frame_data = NULL;
+static long g_latest_frame_len = 0;
+static ULONGLONG g_latest_frame_id = 0;
+static LONGLONG g_latest_qpc_ticks = 0;
+static LONGLONG g_latest_sample_time_100ns = 0;
+static DWORD g_latest_timestamp_flags = 0;
+static LARGE_INTEGER g_qpc_frequency;
+static int g_frame_sync_initialized = 0;
+
+typedef struct {
+    ISampleGrabberCB iface;
+    LONG ref_count;
+} sample_grabber_callback_t;
+extern sample_grabber_callback_t g_sample_grabber_callback_obj;
 
 /* ------------------------------------------------------------------ */
 /* Utility: wide string to narrow (UTF-8)                              */
@@ -596,8 +629,15 @@ static int open_camera(void)
     mt.majortype = MEDIATYPE_Video;
     mt.subtype = use_mjpeg ? MEDIASUBTYPE_MJPG : MEDIASUBTYPE_YUY2;
     pGrabber->lpVtbl->SetMediaType(pGrabber, &mt);
-    pGrabber->lpVtbl->SetBufferSamples(pGrabber, TRUE);
+    /* Callback mode preserves per-sample timing; polling returns stale buffers. */
+    pGrabber->lpVtbl->SetBufferSamples(pGrabber, FALSE);
     pGrabber->lpVtbl->SetOneShot(pGrabber, FALSE);
+    hr = pGrabber->lpVtbl->SetCallback(
+        pGrabber, (void *)&g_sample_grabber_callback_obj.iface, 0);
+    if (FAILED(hr)) {
+        fprintf(stderr, "Failed to register Sample Grabber callback (hr=0x%08lx)\n", hr);
+        return -1;
+    }
 
     /* Add grabber to graph */
     hr = IGraphBuilder_AddFilter(pGraph, pGrabFilter, L"Grabber");
@@ -830,97 +870,143 @@ static int yuyv_to_jpeg(const void *yuyv_data, size_t yuyv_len,
 #endif /* HAVE_LIBJPEG */
 
 /* ------------------------------------------------------------------ */
-/* Frame capture                                                       */
+/* Callback-driven DirectShow frame capture                            */
 /* ------------------------------------------------------------------ */
 
-/* Duplicate frame detection state.
- * ISampleGrabber::GetCurrentBuffer is a polling API — it returns the
- * same buffer until DirectShow delivers a new frame.  Without this
- * check the server would flood the TCP connection with duplicate data,
- * causing high CPU usage and starving the Python UI of update time.
- * We compare frame size + a fast checksum of the first 64 bytes.
- */
-static long  prev_frame_size = 0;
-static DWORD prev_frame_hash = 0;
-
-static DWORD quick_hash(const unsigned char *data, long len)
+static HRESULT STDMETHODCALLTYPE sample_cb_query_interface(
+    ISampleGrabberCB *iface, REFIID riid, void **ppv)
 {
-    DWORD h = 0x811c9dc5u;  /* FNV-1a offset basis */
-    long n = len < 64 ? len : 64;
-    for (long i = 0; i < n; i++) {
-        h ^= data[i];
-        h *= 0x01000193u;   /* FNV-1a prime */
+    if (!ppv) return E_POINTER;
+    *ppv = NULL;
+    if (IsEqualIID(riid, &IID_IUnknown) ||
+        IsEqualIID(riid, &IID_ISampleGrabberCB)) {
+        *ppv = iface;
+        iface->lpVtbl->AddRef(iface);
+        return S_OK;
     }
-    return h;
+    return E_NOINTERFACE;
 }
 
-/* Get the current frame from the sample grabber.
- * For MJPEG: raw JPEG data from the grabber buffer.
- * For YUYV:  convert to JPEG (requires HAVE_LIBJPEG).
- * Returns 0 on success, -1 on failure (includes duplicate detection).
- * Caller must free(*out_data) when done.
- */
-static int capture_frame(unsigned char **out_data, long *out_len)
+static ULONG STDMETHODCALLTYPE sample_cb_add_ref(ISampleGrabberCB *iface)
 {
-    long buf_size = 0;
-    HRESULT hr;
+    sample_grabber_callback_t *self = (sample_grabber_callback_t *)iface;
+    return (ULONG)InterlockedIncrement(&self->ref_count);
+}
 
-    /* First call to get buffer size */
-    hr = pGrabber->lpVtbl->GetCurrentBuffer(pGrabber, &buf_size, NULL);
-    /* Defense in depth: if the graph has stopped under us in steady state,
-     * EC_DEVICE_LOST may not have fired (some drivers are lax). Treat a
-     * stopped-graph error as a fatal disconnect. */
-    if (hr == VFW_E_NOT_RUNNING) {
-        fprintf(stderr,
-                "ERROR: Capture graph stopped (VFW_E_NOT_RUNNING), exiting\n");
-        fflush(stderr);
-        exit(1);
-    }
-    if (FAILED(hr) || buf_size <= 0)
-        return -1;
+static ULONG STDMETHODCALLTYPE sample_cb_release(ISampleGrabberCB *iface)
+{
+    sample_grabber_callback_t *self = (sample_grabber_callback_t *)iface;
+    LONG refs = InterlockedDecrement(&self->ref_count);
+    return (ULONG)(refs < 0 ? 0 : refs);
+}
 
-    unsigned char *buf = (unsigned char *)malloc(buf_size);
-    if (!buf) return -1;
+static HRESULT STDMETHODCALLTYPE sample_cb_sample(
+    ISampleGrabberCB *iface, double sample_time, IMediaSample *sample)
+{
+    (void)iface; (void)sample_time;
+    if (!sample || !g_frame_sync_initialized) return S_OK;
+    BYTE *source = NULL;
+    HRESULT hr = sample->lpVtbl->GetPointer(sample, &source);
+    if (FAILED(hr) || !source) return S_OK;
+    long source_len = sample->lpVtbl->GetActualDataLength(sample);
+    if (source_len <= 0 || source_len > MAX_FRAME_BYTES) return S_OK;
 
-    hr = pGrabber->lpVtbl->GetCurrentBuffer(pGrabber, &buf_size, (long *)buf);
-    if (FAILED(hr)) {
-        free(buf);
-        return -1;
-    }
-
-    /* Duplicate frame detection — skip if same as previous */
-    DWORD h = quick_hash(buf, buf_size);
-    if (buf_size == prev_frame_size && h == prev_frame_hash) {
-        free(buf);
-        return -1;  /* same frame, caller will sleep */
-    }
-    prev_frame_size = buf_size;
-    prev_frame_hash = h;
-
+    unsigned char *frame = NULL;
+    long frame_len = 0;
     if (use_mjpeg) {
-        *out_data = buf;
-        *out_len = buf_size;
-        return 0;
+        frame = (unsigned char *)malloc((size_t)source_len);
+        if (!frame) return S_OK;
+        memcpy(frame, source, (size_t)source_len);
+        frame_len = source_len;
+    } else {
+#ifdef HAVE_LIBJPEG
+        unsigned char *jpeg = NULL;
+        unsigned long jpeg_len = 0;
+        if (yuyv_to_jpeg(source, (size_t)source_len, &jpeg, &jpeg_len) < 0 ||
+            jpeg_len == 0 || jpeg_len > MAX_FRAME_BYTES) {
+            free(jpeg);
+            return S_OK;
+        }
+        frame = jpeg;
+        frame_len = (long)jpeg_len;
+#else
+        return S_OK;
+#endif
     }
 
-#ifdef HAVE_LIBJPEG
-    /* YUYV → JPEG */
-    unsigned char *jpeg_data = NULL;
-    unsigned long jpeg_len = 0;
-    if (yuyv_to_jpeg(buf, (size_t)buf_size, &jpeg_data, &jpeg_len) < 0) {
-        free(buf);
-        return -1;
+    LARGE_INTEGER qpc;
+    if (!QueryPerformanceCounter(&qpc)) { free(frame); return S_OK; }
+    REFERENCE_TIME sample_start = 0, sample_end = 0;
+    DWORD flags = 0;
+    if (SUCCEEDED(sample->lpVtbl->GetTime(sample, &sample_start, &sample_end)))
+        flags |= 1u;
+
+    EnterCriticalSection(&g_frame_lock);
+    free(g_latest_frame_data);
+    g_latest_frame_data = frame;
+    g_latest_frame_len = frame_len;
+    ++g_latest_frame_id;
+    g_latest_qpc_ticks = qpc.QuadPart;
+    g_latest_sample_time_100ns = (flags & 1u) ? sample_start : 0;
+    g_latest_timestamp_flags = flags;
+    SetEvent(g_frame_event);
+    LeaveCriticalSection(&g_frame_lock);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE sample_cb_buffer(
+    ISampleGrabberCB *iface, double sample_time, BYTE *buffer, long length)
+{
+    (void)iface; (void)sample_time; (void)buffer; (void)length;
+    return E_NOTIMPL;
+}
+
+static const ISampleGrabberCBVtbl g_sample_grabber_callback_vtbl = {
+    sample_cb_query_interface, sample_cb_add_ref, sample_cb_release,
+    sample_cb_sample, sample_cb_buffer
+};
+
+sample_grabber_callback_t g_sample_grabber_callback_obj = {
+    { &g_sample_grabber_callback_vtbl }, 1
+};
+
+static int take_next_frame(
+    ULONGLONG *last_sent_id, unsigned char **out_data, long *out_len,
+    ULONGLONG *out_frame_id, LONGLONG *out_qpc_ticks,
+    LONGLONG *out_sample_time, DWORD *out_flags)
+{
+    *out_data = NULL;
+    *out_len = 0;
+    if (WaitForSingleObject(g_frame_event, 1000) != WAIT_OBJECT_0) return 1;
+    EnterCriticalSection(&g_frame_lock);
+    if (!g_latest_frame_data || g_latest_frame_id <= *last_sent_id) {
+        ResetEvent(g_frame_event);
+        LeaveCriticalSection(&g_frame_lock);
+        return 1;
     }
-    free(buf);
-    *out_data = jpeg_data;
-    *out_len = (long)jpeg_len;
+    unsigned char *copy = (unsigned char *)malloc((size_t)g_latest_frame_len);
+    if (!copy) { LeaveCriticalSection(&g_frame_lock); return -1; }
+    memcpy(copy, g_latest_frame_data, (size_t)g_latest_frame_len);
+    *out_len = g_latest_frame_len;
+    *out_frame_id = g_latest_frame_id;
+    *out_qpc_ticks = g_latest_qpc_ticks;
+    *out_sample_time = g_latest_sample_time_100ns;
+    *out_flags = g_latest_timestamp_flags;
+    *last_sent_id = g_latest_frame_id;
+    ResetEvent(g_frame_event);
+    LeaveCriticalSection(&g_frame_lock);
+    *out_data = copy;
     return 0;
-#else
-    /* No libjpeg — cannot convert YUYV */
-    fprintf(stderr, "YUYV capture but no libjpeg support compiled in\n");
-    free(buf);
-    return -1;
-#endif
+}
+
+static void write_u64_le(unsigned char *out, ULONGLONG value)
+{
+    for (int i = 0; i < 8; ++i) out[i] = (unsigned char)(value >> (8 * i));
+}
+
+static void write_u32_le(unsigned char *out, DWORD value)
+{
+    for (int i = 0; i < 4; ++i) out[i] = (unsigned char)(value >> (8 * i));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1042,14 +1128,16 @@ static void build_hello_json(char *buf, size_t buflen)
     char escaped_model[256];
     json_escape(escaped_model, sizeof(escaped_model), camera_model);
     snprintf(buf, buflen,
-        "{\"protocol_version\":1,"
-        "\"backend\":\"windows-directshow\","
-        "\"backend_version\":\"0.1.0\","
-        "\"camera_model\":\"%s\","
-        "\"stream_format\":\"MJPEG\","
-        "\"default_width\":%d,"
-        "\"default_height\":%d,"
-        "\"default_fps\":30}",
+        "{\\"protocol_version\\":2,"
+        "\\"backend\\":\\"windows-directshow\\","
+        "\\"backend_version\\":\\"0.2.0\\","
+        "\\"camera_model\\":\\"%s\\","
+        "\\"stream_format\\":\\"MJPEG\\","
+        "\\"timestamp_clock\\":\\"windows_qpc\\","
+        "\\"frame_metadata\\":\\"PNF2\\","
+        "\\"default_width\\":%d,"
+        "\\"default_height\\":%d,"
+        "\\"default_fps\\":30}",
         escaped_model, CAPTURE_W, CAPTURE_H);
 }
 
@@ -1207,63 +1295,79 @@ static void poll_commands(SOCKET client_fd)
 
 static void handle_client(SOCKET client_fd)
 {
-    /* Send HELLO immediately so the client sees the handshake start before
-       slow DirectShow control probing runs. */
     char hello[512];
     build_hello_json(hello, sizeof(hello));
-    if (send_json_message(client_fd, MSG_HELLO, hello) < 0) {
-        fprintf(stderr, "Failed to send HELLO\n");
-        return;
-    }
+    if (send_json_message(client_fd, MSG_HELLO, hello) < 0) return;
 
-    /* Wait for client HELLO */
-    uint32_t msg_type;
+    uint32_t msg_type = 0, length = 0;
     unsigned char *payload = NULL;
-    uint32_t length;
     if (read_message(client_fd, &msg_type, &payload, &length) < 0) {
-        fprintf(stderr, "Failed to read client HELLO\n");
-        free(payload);
-        return;
+        free(payload); return;
     }
     if (msg_type != MSG_HELLO) {
-        fprintf(stderr, "Expected HELLO from client, got 0x%02x\n", msg_type);
         free(payload);
+        fprintf(stderr, "Expected client HELLO, got 0x%02x\n", msg_type);
         return;
     }
     free(payload);
 
-    /* Probe controls now that the handshake is complete. */
     probe_controls();
-
-    /* Send CONTROL_INFO */
     char info[1024];
     build_control_info_json(info, sizeof(info));
-    if (send_json_message(client_fd, MSG_CONTROL_INFO, info) < 0) {
-        fprintf(stderr, "Failed to send CONTROL_INFO\n");
+    if (send_json_message(client_fd, MSG_CONTROL_INFO, info) < 0) return;
+
+    /* Complete clock-domain handshake before sending the first frame. */
+    payload = NULL;
+    if (read_message(client_fd, &msg_type, &payload, &length) < 0) {
+        free(payload);
+        fprintf(stderr, "Client did not complete camera clock sync\n");
         return;
     }
+    free(payload);
+    if (msg_type != MSG_CLOCK_SYNC_REQUEST) {
+        fprintf(stderr, "Expected CLOCK_SYNC_REQUEST, got 0x%02x\n", msg_type);
+        return;
+    }
+    LARGE_INTEGER qpc;
+    if (!QueryPerformanceCounter(&qpc) || g_qpc_frequency.QuadPart <= 0) return;
+    char sync[160];
+    snprintf(sync, sizeof(sync),
+        "{\\"qpc_ticks\\":%llu,\\"qpc_frequency\\":%llu}",
+        (unsigned long long)qpc.QuadPart,
+        (unsigned long long)g_qpc_frequency.QuadPart);
+    if (send_json_message(client_fd, MSG_CLOCK_SYNC, sync) < 0) return;
 
-    /* Stream loop */
+    ULONGLONG last_sent_id = 0;
     while (!InterlockedCompareExchange(&stop_flag, 0, 0)) {
         unsigned char *frame_data = NULL;
         long frame_len = 0;
-
-        if (capture_frame(&frame_data, &frame_len) < 0) {
-            /* No frame ready yet — small sleep to avoid busy-waiting */
-            Sleep(5);
-            continue;
+        ULONGLONG frame_id = 0;
+        LONGLONG qpc_ticks = 0, sample_time = 0;
+        DWORD flags = 0;
+        int taken = take_next_frame(&last_sent_id, &frame_data, &frame_len,
+                                    &frame_id, &qpc_ticks, &sample_time, &flags);
+        if (taken > 0) { poll_commands(client_fd); continue; }
+        if (taken < 0) { Sleep(5); continue; }
+        if (frame_len <= 0 || (uint64_t)frame_len + FRAME_META_SIZE > MAX_FRAME_BYTES) {
+            free(frame_data); continue;
         }
-
-        if (send_message(client_fd, MSG_FRAME, frame_data,
-                         (uint32_t)frame_len) < 0) {
-            free(frame_data);
-            fprintf(stderr, "Client disconnected (send failed)\n");
+        uint32_t payload_len = (uint32_t)frame_len + FRAME_META_SIZE;
+        unsigned char *frame_payload = (unsigned char *)malloc(payload_len);
+        if (!frame_payload) { free(frame_data); continue; }
+        memcpy(frame_payload, FRAME_META_MAGIC, 4);
+        write_u64_le(frame_payload + 4, frame_id);
+        write_u64_le(frame_payload + 12, (ULONGLONG)qpc_ticks);
+        write_u64_le(frame_payload + 20, (ULONGLONG)g_qpc_frequency.QuadPart);
+        write_u64_le(frame_payload + 28, (ULONGLONG)sample_time);
+        write_u32_le(frame_payload + 36, flags);
+        memcpy(frame_payload + FRAME_META_SIZE, frame_data, (size_t)frame_len);
+        int send_result = send_message(client_fd, MSG_FRAME, frame_payload, payload_len);
+        free(frame_payload);
+        free(frame_data);
+        if (send_result < 0) {
+            fprintf(stderr, "Client disconnected (frame send failed)\n");
             return;
         }
-
-        free(frame_data);
-
-        /* Poll for incoming commands between frames */
         poll_commands(client_fd);
     }
 }
@@ -1309,6 +1413,20 @@ int main(void)
         return 1;
     }
 
+    if (!QueryPerformanceFrequency(&g_qpc_frequency) ||
+        g_qpc_frequency.QuadPart <= 0) {
+        fprintf(stderr, "QueryPerformanceFrequency failed\n");
+        CoUninitialize(); WSACleanup(); return 1;
+    }
+    InitializeCriticalSection(&g_frame_lock);
+    g_frame_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!g_frame_event) {
+        fprintf(stderr, "CreateEvent for camera frames failed\n");
+        DeleteCriticalSection(&g_frame_lock);
+        CoUninitialize(); WSACleanup(); return 1;
+    }
+    g_frame_sync_initialized = 1;
+
     /* Build the camera allowlist (built-ins + PUSHNAV_CAMERA_IDS) */
     init_allowlist();
 
@@ -1323,6 +1441,10 @@ int main(void)
                 "model, add its vid:pid to PUSHNAV_CAMERA_IDS.\n");
         if (seen[0])
             fprintf(stderr, "USB video devices seen:\n%s", seen);
+        g_frame_sync_initialized = 0;
+        CloseHandle(g_frame_event);
+        g_frame_event = NULL;
+        DeleteCriticalSection(&g_frame_lock);
         CoUninitialize();
         WSACleanup();
         return 1;
@@ -1429,6 +1551,14 @@ int main(void)
 
     closesocket(server_fd);
     close_camera();
+    g_frame_sync_initialized = 0;
+    EnterCriticalSection(&g_frame_lock);
+    free(g_latest_frame_data);
+    g_latest_frame_data = NULL;
+    LeaveCriticalSection(&g_frame_lock);
+    if (g_frame_event) CloseHandle(g_frame_event);
+    g_frame_event = NULL;
+    DeleteCriticalSection(&g_frame_lock);
     CoUninitialize();
     WSACleanup();
     fprintf(stderr, "Camera server exiting\n");
