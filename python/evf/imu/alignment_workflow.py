@@ -54,6 +54,7 @@ class ImuAlignmentWorkflow:
     MIN_CAMERA_PAIRS = 4
     MAX_SENSOR_RMS_DEG = 5.0
     MAX_CAMERA_RMS_DEG = 3.0
+    MIN_CAMERA_PAIR_SEPARATION_DEG = 5.0
 
     def __init__(self, service):
         self.service = service
@@ -405,6 +406,17 @@ class ImuAlignmentWorkflow:
         with self._lock:
             if any(item.frame_id == pair.frame_id for item in self._camera_pairs):
                 return self.status()
+            # One pair per materially distinct pointing pose. This prevents a
+            # stationary scope producing dozens of nearly identical solves
+            # and dominating the camera/telescope rotation fit.
+            new_matrix = np.asarray(pair.camera_to_sky, dtype=float)
+            for existing in self._camera_pairs:
+                old_matrix = np.asarray(existing.camera_to_sky, dtype=float)
+                relative = old_matrix.T @ new_matrix
+                cosine = float(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0))
+                separation = math.degrees(math.acos(cosine))
+                if separation < self.MIN_CAMERA_PAIR_SEPARATION_DEG:
+                    return self.status()
             self._camera_pairs.append(pair)
             self._camera_fit = None
 
