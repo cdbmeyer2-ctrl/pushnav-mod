@@ -416,3 +416,56 @@ def test_set_sensor_to_telescope_resets_published_orientation_state(tmp_path):
     assert service.latest_snapshot is None
     assert len(service.orientation_history) == 0
 
+
+
+def test_worker_starts_new_continuity_epoch_after_long_device_gap(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    service = ImuService(tmp_path)
+    samples = [
+        RawSample(1, 100000, 0, 0, 16384, 0, 0, 131, 0),
+        RawSample(2, 500001, 0, 0, 16384, 0, 0, 131, 0),
+    ]
+    records = [
+        SimpleNamespace(sample=samples[0], received_at_monotonic=10.0,
+                        batch_id=1, device_time_us=100000),
+        SimpleNamespace(sample=samples[1], received_at_monotonic=10.01,
+                        batch_id=2, device_time_us=500001),
+    ]
+
+    class FakeHistory:
+        def snapshot(self):
+            return tuple(records)
+
+    class FakeStream:
+        history = FakeHistory()
+
+    class FakeEstimator:
+        q = (1.0, 0.0, 0.0, 0.0)
+
+        def __init__(self):
+            self.reset_count = 0
+            self.update_count = 0
+
+        def reset_reference(self):
+            self.reset_count += 1
+
+        def update(self, sample, device_time_us):
+            self.update_count += 1
+            if self.update_count == 2:
+                service._worker_stop_event.set()
+            return Attitude(reference_initialized=True)
+
+    service.stream = FakeStream()
+    service.estimator = FakeEstimator()
+    monkeypatch.setattr("evf.imu.service.time.monotonic", lambda: 10.02)
+
+    service._run_estimator()
+
+    snapshot = service.latest_snapshot
+    assert snapshot is not None
+    assert snapshot.continuity_id == 1
+    assert service.estimator.reset_count == 1
+    assert len(service.orientation_history) == 1
+    assert service.orientation_history[0].device_time_us == 500001
+
