@@ -1,4 +1,4 @@
-# Copyright (C) 2026 Arun Venkataswamy
+﻿# Copyright (C) 2026 Arun Venkataswamy
 #
 # This file is part of PushNav.
 #
@@ -15,9 +15,9 @@
 # You should have received a copy of the GNU General Public License
 # along with PushNav. If not, see <https://www.gnu.org/licenses/>.
 
-"""Engine coordinator Ã¢â‚¬â€ wires all components together.
+"""Engine coordinator ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â wires all components together.
 
-Per SPEC_ARCHITECTURE.md and impl0.md Ã‚Â§Phase 8.
+Per SPEC_ARCHITECTURE.md and impl0.md Ãƒâ€šÃ‚Â§Phase 8.
 Central coordinator that owns the lifecycle of every subsystem.
 """
 
@@ -89,8 +89,8 @@ _USB_DEVICE_PATH = re.compile(r"/usb\d+/")
 def _usb_video_device_present() -> bool:
     """True if any USB video device is attached (Linux sysfs).
 
-    Lets the headless camera watchdog skip spawning camera_server Ã¢â‚¬â€ and
-    logging its failure Ã¢â‚¬â€ every few seconds while nothing is plugged in.
+    Lets the headless camera watchdog skip spawning camera_server ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â and
+    logging its failure ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â every few seconds while nothing is plugged in.
     Returns True when sysfs is unavailable, so the caller just tries.
     """
     if not _V4L2_SYSFS.is_dir():
@@ -116,6 +116,7 @@ class PlateSolveAnchor:
     quaternion: tuple[float, float, float, float]
     imu_device_time_us: int
     telescope_to_sky: tuple[tuple[float, float, float], ...]
+    continuity_id: int = 0
 
 
 class Engine:
@@ -294,7 +295,7 @@ class Engine:
           1. Stellarium status 'location' field, when a Stellarium client is
              actively reporting one (source='stellarium').
           2. ConfigManager.location, when manually set (source='manual').
-          3. None Ã¢â‚¬â€ neither available (source=None, lat/lon both None).
+          3. None ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â neither available (source=None, lat/lon both None).
         """
         if self._stellarium is not None:
             status = self._stellarium.stellarium_status
@@ -331,7 +332,7 @@ class Engine:
         from evf.engine.sample_injector import load_sample_jpeg
 
         if not self._dev_mode:
-            logger.warning("inject_sample called outside dev_mode Ã¢â‚¬â€ ignoring")
+            logger.warning("inject_sample called outside dev_mode ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â ignoring")
             return
         if name is None:
             self._sample_injector.set_jpeg(None, None)
@@ -352,10 +353,10 @@ class Engine:
     def inject_target(self, ra_deg: float, dec_deg: float) -> None:
         """Set the GOTO target manually (dev only)."""
         if not self._dev_mode:
-            logger.warning("inject_target called outside dev_mode Ã¢â‚¬â€ ignoring")
+            logger.warning("inject_target called outside dev_mode ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â ignoring")
             return
         self._goto_target.set(ra_deg, dec_deg)
-        logger.info("Dev: injected GOTO target at RA %.4fÃ‚Â° Dec %.4fÃ‚Â°", ra_deg, dec_deg)
+        logger.info("Dev: injected GOTO target at RA %.4fÃƒâ€šÃ‚Â° Dec %.4fÃƒâ€šÃ‚Â°", ra_deg, dec_deg)
 
     def capture_frame(self) -> Path | None:
         """Save the latest frame to ~/Downloads as PNG. Returns the path or None."""
@@ -418,7 +419,7 @@ class Engine:
         mobile web URL uses) so mobile apps on the same network can connect.
 
         Returns None when the LX200 server isn't running OR no LAN is
-        available Ã¢â‚¬â€ the UI distinguishes these via the lx200_running flag.
+        available ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the UI distinguishes these via the lx200_running flag.
         """
         if self._lx200 is None:
             return None
@@ -437,7 +438,7 @@ class Engine:
         """True if the Stellarium server currently has any client connected.
 
         Stellarium holds a persistent TCP connection, so this is a simple
-        boolean Ã¢â‚¬â€ the UI lights the Stellarium activity indicator while it
+        boolean ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the UI lights the Stellarium activity indicator while it
         is True.
         """
         return self._stellarium is not None and self._stellarium.client_count > 0
@@ -460,7 +461,7 @@ class Engine:
             return False
         return (time.monotonic() - last) < self._LX200_INDICATOR_HOLD
 
-    # -- startup (Ã‚Â§8.2) -------------------------------------------------------
+    # -- startup (Ãƒâ€šÃ‚Â§8.2) -------------------------------------------------------
 
     def startup_logging(self) -> None:
         """Initialize logging and log version info."""
@@ -488,6 +489,8 @@ class Engine:
                 raise ValueError("IMU sensor-to-telescope mapping is not VERIFIED")
             if alignment.get("camera_from_telescope_status") != "VERIFIED":
                 raise ValueError("camera_from_telescope calibration is not VERIFIED")
+            if alignment.get("camera_timing_status") != "VERIFIED_CALLBACK_QPC":
+                raise ValueError("camera frame clock/timing calibration is not VERIFIED")
 
             matrix = np.asarray(alignment["camera_from_telescope"], dtype=float)
             if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
@@ -627,11 +630,11 @@ class Engine:
         """Spawn camera subprocess, connect, handshake, restore settings.
 
         On first launch (config has no saved exposure/gain), each control is
-        initialized to the midpoint of the range the camera reports Ã¢â‚¬â€ which
+        initialized to the midpoint of the range the camera reports ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â which
         differs by OS/camera backend, so we can't hardcode sensible defaults.
 
         With no USB video device attached (Linux), skips spawning
-        camera_server Ã¢â‚¬â€ it would only fail and log its allowlist.
+        camera_server ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â it would only fail and log its allowlist.
         """
         if not _usb_video_device_present():
             self._log_waiting_for_camera()
@@ -772,7 +775,7 @@ class Engine:
 
     def _log_waiting_for_camera(self) -> None:
         if not self._camera_wait_logged:
-            logger.info("Waiting for camera Ã¢â‚¬â€ plug it in to continue")
+            logger.info("Waiting for camera ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â plug it in to continue")
             self._camera_wait_logged = True
 
     def _camera_watchdog_loop(self, interval_s: float) -> None:
@@ -879,6 +882,17 @@ class Engine:
                 if snapshot is None:
                     continue
                 if time.monotonic() - snapshot.received_at_monotonic > 0.25:
+                    with self._plate_solve_anchor_lock:
+                        if self._plate_solve_anchor == anchor:
+                            self._plate_solve_anchor = None
+                    continue
+                if getattr(snapshot, "continuity_id", 0) != getattr(anchor, "continuity_id", 0):
+                    with self._plate_solve_anchor_lock:
+                        if self._plate_solve_anchor == anchor:
+                            self._plate_solve_anchor = None
+                    logger.warning(
+                        "IMU continuity epoch changed; waiting for a fresh plate solve"
+                    )
                     continue
 
                 key = (anchor.frame_id, snapshot.device_time_us)
@@ -906,7 +920,8 @@ class Engine:
                 logger.exception("IMU pointing propagation failed")
 
     def _capture_plate_solve_anchor(
-        self, pointing: PointingSnapshot, frame_timestamp: float, frame_id: int
+        self, pointing: PointingSnapshot, frame_timestamp: float, frame_id: int,
+        frame_metadata=None,
     ) -> None:
         """Pair a plate solve with IMU orientation and a verified body transform."""
         workflow = self._imu_alignment_workflow
@@ -916,7 +931,9 @@ class Engine:
             and pointing.valid
         ):
             try:
-                workflow.capture_camera_pair(pointing, frame_timestamp, frame_id)
+                workflow.capture_camera_pair(
+                    pointing, frame_timestamp, frame_id, frame_metadata
+                )
             except Exception as exc:
                 logger.debug("IMU camera calibration pair rejected: %s", exc)
 
@@ -928,11 +945,17 @@ class Engine:
             and getattr(service, "sensor_mapping_verified", False)
         )
 
+        timing_quality = getattr(frame_metadata, "timestamp_quality", "untrusted")
+        timing_clock_verified = bool(
+            getattr(frame_metadata, "clock_sync_verified", False)
+        )
         if (
             not pointing.valid
             or service is None
             or not sensor_mapping_verified
             or camera_from_telescope is None
+            or timing_quality != "callback"
+            or not timing_clock_verified
         ):
             with self._plate_solve_anchor_lock:
                 self._plate_solve_anchor = None
@@ -953,6 +976,11 @@ class Engine:
             return
 
         device_time_us, quaternion = orientation
+        current_snapshot = service.latest_snapshot
+        if current_snapshot is None:
+            with self._plate_solve_anchor_lock:
+                self._plate_solve_anchor = None
+            return
         camera_to_sky = orientation_from_radec_roll(
             pointing.ra_j2000, pointing.dec_j2000, pointing.roll
         )
@@ -971,6 +999,7 @@ class Engine:
                 tuple(float(value) for value in row)
                 for row in telescope_to_sky
             ),
+            continuity_id=getattr(current_snapshot, "continuity_id", 0),
         )
         with self._plate_solve_anchor_lock:
             self._plate_solve_anchor = anchor
@@ -992,7 +1021,7 @@ class Engine:
             if self._webserver is not None:
                 self._webserver._solver_failures = lambda: self.consecutive_failures
 
-    # -- tracking lifecycle (Ã‚Â§8.3) --------------------------------------------
+    # -- tracking lifecycle (Ãƒâ€šÃ‚Â§8.3) --------------------------------------------
 
     def skip_calibration(self) -> None:
         """Skip finder rotation calibration, proceed to tracking."""
@@ -1006,7 +1035,7 @@ class Engine:
         Only valid from SYNC state when config has saved calibration data.
         """
         if not self.camera_connected:
-            logger.info("use_previous_calibration ignored Ã¢â‚¬â€ camera not connected")
+            logger.info("use_previous_calibration ignored ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â camera not connected")
             return
         if self._state_machine.state != EngineState.SYNC:
             return
@@ -1019,11 +1048,11 @@ class Engine:
         self._solver_thread.set_sync_d_body(d_body)
         logger.info(
             "Using previous calibration: d_body=(%.6f, %.6f, %.6f) "
-            "finder_rotation=%.1fÃ‚Â°",
+            "finder_rotation=%.1fÃƒâ€šÃ‚Â°",
             d_body[0], d_body[1], d_body[2],
             self._config.finder_rotation,
         )
-        self._solver_thread.start()  # SYNC Ã¢â€ â€™ WARMING_UP
+        self._solver_thread.start()  # SYNC ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ WARMING_UP
 
     def calibrate_imu_stationary(self) -> None:
         """Run stationary gyro calibration using the active IMU stream."""
@@ -1098,6 +1127,16 @@ class Engine:
         if workflow is None or service is None:
             raise RuntimeError("IMU workflow is not running")
         measured = workflow.measured_result()
+        timing_evidence = measured.get("camera_timing_evidence")
+        if (
+            not isinstance(timing_evidence, dict)
+            or timing_evidence.get("timestamp_source") != "directshow_sample_callback_qpc"
+            or timing_evidence.get("clock_sync_verified") is not True
+        ):
+            raise RuntimeError(
+                "Camera timing evidence is not verified; collect pairs from the "
+                "native Windows DirectShow v2 camera server"
+            )
         sensor_matrix = np.asarray(measured["sensor_to_telescope"], dtype=float)
         camera_matrix = np.asarray(measured["camera_from_telescope"], dtype=float)
         if not getattr(service, "sensor_mapping_verified", False):
@@ -1121,6 +1160,12 @@ class Engine:
             "mapping_status": "VERIFIED",
             "camera_from_telescope": camera_matrix.tolist(),
             "camera_from_telescope_status": "VERIFIED",
+            "camera_timing_status": "VERIFIED_CALLBACK_QPC",
+            "camera_timing_note": (
+                "QPC timestamp is sampled in DirectShow SampleCB. This verifies "
+                "the host clock domain, not sensor exposure midpoint; perform "
+                "physical stationary/motion validation before relying on tracking."
+            ),
             "calibration_evidence": measured,
         })
         temp_name = None
@@ -1185,6 +1230,9 @@ class Engine:
             "camera_alignment_status": (
                 "VERIFIED" if camera_verified else "UNVERIFIED"
             ),
+            "camera_timing_status": saved.get(
+                "camera_timing_status", "UNVERIFIED"
+            ),
             "sensor_to_telescope": (
                 saved.get("sensor_to_telescope") if sensor_verified else None
             ),
@@ -1214,15 +1262,15 @@ class Engine:
         )
 
     def step_advance(self) -> None:
-        """Advance the wizard: SETUP Ã¢â€ â€™ SYNC Ã¢â€ â€™ SYNC_CONFIRM Ã¢â€ â€™ CALIBRATE Ã¢â€ â€™ WARMING_UP, or stop."""
+        """Advance the wizard: SETUP ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ SYNC ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ SYNC_CONFIRM ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ CALIBRATE ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ WARMING_UP, or stop."""
         state = self._state_machine.state
         logger.info("step_advance called, state=%s", state.value)
         # Every forward step needs camera frames. Only the "stop tracking"
-        # branch (WARMING_UP/TRACKING Ã¢â€ â€™ SETUP) works without a camera.
+        # branch (WARMING_UP/TRACKING ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ SETUP) works without a camera.
         if not self.camera_connected and state not in (
             EngineState.WARMING_UP, EngineState.TRACKING,
         ):
-            logger.info("step_advance ignored Ã¢â‚¬â€ camera not connected")
+            logger.info("step_advance ignored ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â camera not connected")
             return
         if state == EngineState.SETUP:
             self._state_machine.transition(EngineState.SYNC)
@@ -1316,7 +1364,7 @@ class Engine:
             self._sync_camera_ra,
             self._sync_camera_dec,
             self._sync_camera_roll,
-        )  # SYNC_CONFIRM Ã¢â€ â€™ CALIBRATE
+        )  # SYNC_CONFIRM ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ CALIBRATE
 
     def sync_retry(self) -> None:
         """Go back to SYNC to redo the current solve (preserves earlier pairs)."""
@@ -1352,7 +1400,7 @@ class Engine:
     def sync_in_progress(self) -> bool:
         return self._sync_lock.locked()
 
-    # -- camera control (Ã‚Â§8.4) ------------------------------------------------
+    # -- camera control (Ãƒâ€šÃ‚Â§8.4) ------------------------------------------------
 
     def set_control(self, control_id: str, value: int) -> None:
         """Send a camera control change and persist to config."""
@@ -1365,7 +1413,7 @@ class Engine:
         elif control_id == "gain":
             self._config.gain = value
 
-    # -- shutdown (Ã‚Â§8.5) ------------------------------------------------------
+    # -- shutdown (Ãƒâ€šÃ‚Â§8.5) ------------------------------------------------------
 
     def shutdown(self) -> None:
         """Graceful shutdown. Each step with independent timeout."""
@@ -1460,4 +1508,5 @@ class Engine:
             logger.info("EVF version: %s", version)
         except (FileNotFoundError, json.JSONDecodeError) as exc:
             logger.warning("Could not read VERSION.json: %s", exc)
+
 
