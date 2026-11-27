@@ -1,0 +1,188 @@
+﻿"""Lifecycle wrapper for the optional telescope IMU."""
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+import json
+import logging
+from pathlib import Path
+import threading
+import time
+
+from evf.imu.calibration import Calibration
+from evf.imu.estimator import Attitude, RelativeAttitudeEstimator
+from evf.imu.stream import ImuSerialStream
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ImuSnapshot:
+    """One synchronized IMU attitude, rotation, and sample timestamp."""
+
+    attitude: Attitude
+    quaternion: tuple[float, float, float, float]
+    device_time_us: int
+    received_at_monotonic: float
+
+
+class ImuService:
+    """Loads IMU configuration and owns the serial reader and estimator."""
+
+    def __init__(self, config_dir: Path, port: str = "COM3"):
+        self.config_dir = Path(config_dir)
+        self.port = port
+        self.stream: ImuSerialStream | None = None
+        self.estimator: RelativeAttitudeEstimator | None = None
+
+        self._worker_thread: threading.Thread | None = None
+        self._worker_stop_event = threading.Event()
+        self._attitude_lock = threading.Lock()
+        self._latest_attitude: Attitude | None = None
+        self._latest_snapshot: ImuSnapshot | None = None
+
+    @property
+    def latest_attitude(self) -> Attitude | None:
+        """Return a safe copy of the most recently estimated attitude."""
+        with self._attitude_lock:
+            if self._latest_attitude is None:
+                return None
+            return replace(self._latest_attitude)
+
+    @property
+    def latest_snapshot(self) -> ImuSnapshot | None:
+        """Return a safe copy of the latest synchronized IMU snapshot."""
+        with self._attitude_lock:
+            snapshot = self._latest_snapshot
+            if snapshot is None:
+                return None
+            return replace(
+                snapshot,
+                attitude=replace(snapshot.attitude),
+            )
+
+    def start(self) -> bool:
+        calibration_path = self.config_dir / "imu_calibration.json"
+        alignment_path = self.config_dir / "sensor_alignment.json"
+
+        try:
+            with calibration_path.open("r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+
+            calibration = Calibration(
+                gyro_bias_dps=tuple(data["gyro_bias_dps"]),
+                accel_mean_g=tuple(data["accel_mean_g"]),
+                gyro_noise_dps=tuple(data["gyro_noise_dps"]),
+                sample_count=int(data["sample_count"]),
+            )
+
+            with alignment_path.open("r", encoding="utf-8-sig") as f:
+                alignment = json.load(f)
+
+            if alignment.get("mapping_status") != "VERIFIED":
+                logger.warning(
+                    "IMU axis mapping is provisional; relative motion only."
+                )
+
+            self.estimator = RelativeAttitudeEstimator(
+                calibration,
+                sensor_to_telescope=alignment["sensor_to_telescope"],
+                accel_kp=alignment.get("accel_kp_per_second", 2.0),
+                min_accel_g=alignment.get("min_accel_g", 0.85),
+                max_accel_g=alignment.get("max_accel_g", 1.15),
+                altitude_sign=alignment.get("altitude_sign", 1.0),
+                azimuth_sign=alignment.get("azimuth_sign", 1.0),
+            )
+
+            self.stream = ImuSerialStream(
+                port=self.port,
+                baudrate=115200,
+            )
+            self.stream.start()
+
+            self._worker_stop_event.clear()
+            self._worker_thread = threading.Thread(
+                target=self._run_estimator,
+                name="PushNav-IMU-Estimator",
+                daemon=True,
+            )
+            self._worker_thread.start()
+
+            logger.info(
+                "IMU reader and estimator started on %s at 115200 baud.",
+                self.port,
+            )
+            return True
+
+        except Exception:
+            logger.exception("IMU startup failed; continuing without IMU.")
+            self.stop()
+            self.stream = None
+            self.estimator = None
+            return False
+
+    def _run_estimator(self) -> None:
+        """Process each new serial record once, in device timestamp order."""
+        last_device_time_us: int | None = None
+
+        try:
+            while not self._worker_stop_event.is_set():
+                if self.stream is None or self.estimator is None:
+                    break
+
+                records = self.stream.history.snapshot()
+
+                for record in records:
+                    if self._worker_stop_event.is_set():
+                        break
+
+                    if (
+                        last_device_time_us is not None
+                        and record.device_time_us <= last_device_time_us
+                    ):
+                        continue
+
+                    attitude = self.estimator.update(
+                        record.sample,
+                        device_time_us=record.device_time_us,
+                    )
+                    last_device_time_us = record.device_time_us
+
+                    published = replace(
+                        attitude,
+                        sample_age_s=max(
+                            0.0,
+                            time.monotonic() - record.received_at_monotonic,
+                        ),
+                    )
+
+                    snapshot = ImuSnapshot(
+                        attitude=published,
+                        quaternion=tuple(self.estimator.q),
+                        device_time_us=record.device_time_us,
+                        received_at_monotonic=record.received_at_monotonic,
+                    )
+
+                    with self._attitude_lock:
+                        self._latest_attitude = published
+                        self._latest_snapshot = snapshot
+
+                time.sleep(0.005)
+
+        except Exception:
+            logger.exception("IMU estimator worker failed.")
+
+    def stop(self) -> None:
+        """Stop serial ingestion and then the estimator worker."""
+        if self.stream is not None:
+            self.stream.stop(join_timeout=2.0)
+
+        self._worker_stop_event.set()
+
+        if self._worker_thread is not None:
+            self._worker_thread.join(timeout=2.0)
+            if not self._worker_thread.is_alive():
+                self._worker_thread = None
+
+        if self.stream is not None:
+            logger.info("IMU reader stopped.")
+            self.stream = None
