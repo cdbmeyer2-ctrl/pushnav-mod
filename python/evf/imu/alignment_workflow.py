@@ -41,6 +41,9 @@ class CameraPair:
     timestamp_quality: str = "untrusted"
     clock_sync_verified: bool = False
     timing_uncertainty_s: float | None = None
+    timestamp_source: str = "untrusted"
+    exposure_midpoint_verified: bool = False
+    evidence_origin: str = "untrusted"
 
 
 class ImuAlignmentWorkflow:
@@ -64,6 +67,28 @@ class ImuAlignmentWorkflow:
         self._camera_pairs = []
         self._sensor_fit = None
         self._camera_fit = None
+
+    @staticmethod
+    def _timing_is_verified(item) -> bool:
+        """Only accept independently verified exposure-midpoint timestamps.
+
+        A DirectShow SampleCB/QPC callback timestamp establishes a host clock
+        domain, not the time photons were integrated. It is never sufficient
+        evidence for celestial propagation.
+        """
+        uncertainty = getattr(item, "timing_uncertainty_s", None)
+        try:
+            uncertainty = float(uncertainty)
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            getattr(item, "timestamp_quality", "untrusted") == "exposure_midpoint"
+            and getattr(item, "clock_sync_verified", False) is True
+            and getattr(item, "exposure_midpoint_verified", False) is True
+            and getattr(item, "evidence_origin", "untrusted") == "physical"
+            and math.isfinite(uncertainty)
+            and 0.0 <= uncertainty <= 0.010
+        )
 
     def status(self):
         with self._lock:
@@ -93,7 +118,7 @@ class ImuAlignmentWorkflow:
                 ],
                 "camera_pair_count": len(self._camera_pairs),
                 "trusted_camera_pair_count": sum(
-                    item.timestamp_quality == "callback" and item.clock_sync_verified
+                    self._timing_is_verified(item)
                     for item in self._camera_pairs
                 ),
                 "sensor_fit": self._sensor_fit,
@@ -372,10 +397,11 @@ class ImuAlignmentWorkflow:
             raise RuntimeError("IMU service is not running")
         if frame_metadata is None:
             raise ValueError("Camera frame has no timestamp provenance")
-        if getattr(frame_metadata, "timestamp_quality", "untrusted") != "callback":
-            raise ValueError("Camera frame timestamp is not a native callback timestamp")
-        if not getattr(frame_metadata, "clock_sync_verified", False):
-            raise ValueError("Camera QPC clock has not been synchronized to host monotonic")
+        if not self._timing_is_verified(frame_metadata):
+            raise ValueError(
+                "Camera exposure-midpoint timing is not physically verified "
+                "to <=10 ms; a DirectShow callback/QPC timestamp is insufficient"
+            )
 
         orientation = self.service.orientation_at_host_time(frame_timestamp)
         if orientation is None:
@@ -401,6 +427,9 @@ class ImuAlignmentWorkflow:
             timestamp_quality=frame_metadata.timestamp_quality,
             clock_sync_verified=bool(frame_metadata.clock_sync_verified),
             timing_uncertainty_s=frame_metadata.timing_uncertainty_s,
+            timestamp_source=str(getattr(frame_metadata, "timestamp_source", "untrusted")),
+            exposure_midpoint_verified=bool(frame_metadata.exposure_midpoint_verified),
+            evidence_origin=str(frame_metadata.evidence_origin),
         )
 
         with self._lock:
@@ -479,12 +508,11 @@ class ImuAlignmentWorkflow:
                     "before finalization"
                 )
             if not self._camera_pairs or any(
-                item.timestamp_quality != "callback" or not item.clock_sync_verified
-                for item in self._camera_pairs
+                not self._timing_is_verified(item) for item in self._camera_pairs
             ):
                 raise ValueError(
-                    "Camera timing evidence is incomplete; capture all calibration "
-                    "pairs from the synchronized DirectShow v2 camera stream"
+                    "Camera exposure-midpoint timing is not physically verified "
+                    "to <=10 ms for every pair; callback timestamps cannot be used"
                 )
 
             return {
@@ -495,10 +523,14 @@ class ImuAlignmentWorkflow:
                 "camera_timing_evidence": {
                     "pair_count": len(self._camera_pairs),
                     "frame_ids": [item.frame_id for item in self._camera_pairs],
-                    "timestamp_source": "directshow_sample_callback_qpc",
+                    "timestamp_source": self._camera_pairs[0].timestamp_source,
                     "clock_sync_verified": True,
-                    "timing_uncertainty_s": None,
-                    "exposure_midpoint_verified": False,
+                    "timing_uncertainty_s": max(
+                        float(item.timing_uncertainty_s) for item in self._camera_pairs
+                    ),
+                    "exposure_midpoint_verified": True,
+                    "evidence_origin": "physical",
+                    "timestamp_quality": "exposure_midpoint",
                 },
                 "calibration_method": "physical_sweeps_and_paired_plate_solves_v2",
                 "created_at_unix": time.time(),
