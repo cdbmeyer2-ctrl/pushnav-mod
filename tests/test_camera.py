@@ -139,6 +139,28 @@ class TestCameraClientIntegration:
         finally:
             server.stop()
 
+    def test_v2_qpc_handshake_and_timestamped_frames(self):
+        server = self._start_server(hello={
+            "protocol_version": 2,
+            "timestamp_clock": "windows_qpc",
+        })
+        try:
+            buf = LatestFrame()
+            client = CameraClient(buf, port=server.port)
+            client.connect(timeout=5.0)
+            assert client._clock_sync["verified_same_host_clock"] is True
+            client.start_receiving()
+            time.sleep(0.25)
+            jpeg, timestamp, frame_id, metadata = buf.get_with_metadata()
+            assert jpeg is not None
+            assert timestamp > 0
+            assert frame_id > 0
+            assert metadata.timestamp_quality == "callback"
+            assert metadata.clock_sync_verified is True
+            client.stop()
+        finally:
+            server.stop()
+
     def test_receive_frames(self):
         """Start receiving and verify frames arrive in the buffer."""
         server = self._start_server(fps=20)
